@@ -1,0 +1,8 @@
+{
+  "name": "Remix Doodle Duel",
+  "description": "A simple 2D game where you pull back stick figures on notebook paper to watch them battle each other.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

@@ -8,7 +8,7 @@ import {
 } from './sketchDraw';
 import { WeaponType } from './weapons';
 
-export type CharacterId = 'normal' | 'bucon' | 'nhoc' | 'caokieu' | 'lonsat' | 'hebongbay';
+export type CharacterId = 'normal' | 'bucon' | 'nhoc' | 'caokieu' | 'lonsat' | 'hebongbay' | 'ninja' | 'kysilon' | 'lon' | 'nguoisoi';
 
 export type TauntStyle =
   | 'stickman_flex'
@@ -16,7 +16,10 @@ export type TauntStyle =
   | 'nhoc_hop'
   | 'caokieu_push_glasses'
   | 'lonsat_vent_rev'
-  | 'clown_juggle';
+  | 'clown_juggle'
+  | 'ninja_hand_seal'
+  | 'kysilon_oink'
+  | 'howl';
 
 export type WeaponAffinityTier = 'strong' | 'good' | 'neutral' | 'weak';
 
@@ -29,12 +32,33 @@ export interface CharacterPhaseTime {
 export type GagPropType = 'bananaPeel' | 'creamPie' | 'jackBox';
 
 export interface CharacterTrait {
-  id: 'none' | 'thickSkin' | 'rollDodge' | 'sweetSpot' | 'boiler' | 'gagBag';
+  id: 'none' | 'thickSkin' | 'rollDodge' | 'sweetSpot' | 'boiler' | 'gagBag' | 'escapeLeap' | 'pigMount' | 'pigCompanion' | 'moonForm';
+  splitBelowHp?: number;
+  splitOnKnockdown?: boolean;
+  splitOnThrownShield?: boolean;
+  neverEquipWeapon?: boolean;
   armorPhase?: 'windup';
   armorBelowDmg?: number;
   cooldown?: number;
   invuln?: number;
   cannotDodge?: Array<'windup' | 'aoe' | 'recovery' | 'stunned'>;
+  nearEdge?: number;
+  minConsecutiveHits?: number;
+  needsLandingRoom?: boolean;
+  leap?: {
+    duration: number;
+    landDistance: number;
+    arcHeight?: number;
+    clearsComboQueue: boolean;
+    invulnerable: boolean;
+  };
+  shuriken?: {
+    damage: number;
+    knockback: number;
+    hitOnce: boolean;
+    blockable: boolean;
+    throwAt: 'leapApex';
+  };
   sweetBand?: [number, number];
   sweetDamageMul?: number;
   sweetKnockbackMul?: number;
@@ -48,7 +72,9 @@ export interface CharacterTrait {
     perStrike: number;
     blockedIfBackMarginBelow: number;
   };
-  ignores?: Array<'aoe' | 'thrownShield' | 'drawnWeapon' | 'slip' | 'pieFace'>;
+  ignores?: Array<
+    'aoe' | 'thrownShield' | 'drawnWeapon' | 'slip' | 'pieFace' | 'knockdown' | 'getup' | 'pinned' | 'homeRun' | 'noLandingRoom'
+  >;
   triggerOn?: 'finisherHitDealtDamage';
   sequence?: GagPropType[];
   advanceOnlyWhenPlaced?: boolean;
@@ -78,10 +104,11 @@ export interface CharacterTrait {
   finale?: {
     belowHp: number;
     oncePerMatch: boolean;
-    duration: number;
-    gagOnEveryHit: boolean;
-    moveSpeedMul: number;
-    thenOutOfTricks: {
+    duration?: number;
+    gagOnEveryHit?: boolean;
+    moveSpeedMul?: number;
+    aiOnly?: boolean;
+    thenOutOfTricks?: {
       duration: number;
       noGags: boolean;
       recoveryMul: number;
@@ -153,13 +180,47 @@ export interface CharacterTrait {
       thenOverheat: number;
     };
   };
+  moonForm?: {
+    maxGauge: number;
+    gainPerDamage: number;
+    excludes: Array<'shieldThrow'>;
+    transformDuration: number;
+    transformAction: 'TAUNT';
+    transformInterruptible: boolean;
+    drainDuration: number;
+    weaponStashOnTransform: boolean;
+    wolfStats: {
+      scale: number;
+      hitbox: number;
+      lineWidth: number;
+      jitterFps: number;
+      moveSpeed: number;
+      damageDealt: number;
+      knockbackDealt: number;
+      knockbackTaken: number;
+      phaseTime: CharacterPhaseTime;
+    };
+  };
 }
 
 export interface CharacterAIConfig {
-  style: 'balanced' | 'steadyAdvance' | 'hitAndRun' | 'zoner' | 'boiler' | 'prankster';
+  style:
+    | 'balanced'
+    | 'steadyAdvance'
+    | 'hitAndRun'
+    | 'zoner'
+    | 'boiler'
+    | 'prankster'
+    | 'skirmisher'
+    | 'gladiatorRider'
+    | 'frontliner'
+    | 'weaponUser'
+    | 'moonHunter';
   rageBelowHp?: number;
   preferredRange?: 'midFar' | 'sweetSpot' | number;
   aggression?: number;
+  aggressionByForm?: { human: number; wolf: number };
+  pushWhenMoonHalfFull?: boolean;
   panicBelowHp?: number;
   panicCooldownMul?: number;
   maxComboBeatsInSweet?: number;
@@ -180,6 +241,11 @@ export interface CharacterAIConfig {
   retreatBehindProp?: boolean;
   avoidOwnPeel?: boolean;
   punishWindow?: number;
+  holdInPlaceBounce?: boolean;
+  avoidEdgeWhenTraitCooling?: boolean;
+  waitBelowHp?: number;
+  holdBelowHp?: number;
+  pigHeadbuttCooldown?: number;
 }
 
 export interface CharacterVisualConfig {
@@ -198,7 +264,7 @@ export interface CharacterVisualConfig {
   hairStrands: number;
   glasses: boolean;
   cheekBandage: boolean;
-  faceStyle: 'standard' | 'nhoc' | 'caokieu' | 'lonsat' | 'hebongbay';
+  faceStyle: 'standard' | 'nhoc' | 'caokieu' | 'lonsat' | 'hebongbay' | 'ninja' | 'kysilon' | 'lon' | 'nguoisoi';
   scarfStyle: 'headband' | 'neck' | 'tie' | 'none';
   scarfColor?: string;
   scarfTailLines: number;
@@ -225,6 +291,12 @@ export interface CharacterVisualConfig {
   wings?: { color: string };
   flame?: { color: string };
   clownLook?: boolean;
+  ninjaLook?: boolean;
+  pigRiderLook?: boolean;
+  pigLook?: boolean;
+  brownHelmet?: boolean;
+  wolfLook?: boolean;
+  moonIcon?: boolean;
 }
 
 export interface CharacterEntranceConfig {
@@ -1122,6 +1194,232 @@ function drawCaoKieuCardPortrait(
   ctx.restore();
 }
 
+function drawKySiLonCardPortrait(
+  ctx: CanvasRenderingContext2D,
+  cx: number,
+  cy: number,
+  scale: number,
+  inkColor: string,
+  _accentColor: string,
+  _boilTick: number,
+  tSec: number,
+) {
+  const s = scale * 1.02;
+  const tick8 = Math.floor(tSec * 8);
+  const seed = 7731 + tick8 * 13.7;
+  const bounce = Math.sin(tSec * 7.2) * 1.1 * s;
+  const pigX = cx - 2 * s;
+  const pigY = cy + 12 * s + bounce * 0.5;
+  const lw = 1.85 * s;
+
+  // Pig plump belly wash + outline
+  ctx.save();
+  ctx.fillStyle = 'rgba(253, 164, 175, 0.25)';
+  ctx.beginPath();
+  ctx.ellipse(pigX, pigY, 17.5 * s, 11.5 * s, -0.05, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.restore();
+
+  drawSketchPolyline(
+    ctx,
+    [
+      { x: pigX - 16.5 * s, y: pigY - 2 * s },
+      { x: pigX - 10 * s, y: pigY - 10.5 * s },
+      { x: pigX + 6 * s, y: pigY - 11 * s },
+      { x: pigX + 16.5 * s, y: pigY - 4.5 * s },
+      { x: pigX + 17.5 * s, y: pigY + 4.5 * s },
+      { x: pigX + 8 * s, y: pigY + 10.5 * s },
+      { x: pigX - 10 * s, y: pigY + 10 * s },
+      { x: pigX - 16.5 * s, y: pigY + 3 * s },
+      { x: pigX - 16.5 * s, y: pigY - 2 * s },
+    ],
+    { color: inkColor, lineWidth: lw, roughness: 0.55, seed: seed + 1, passes: 2 },
+  );
+
+  // Curly tail
+  drawSketchPolyline(
+    ctx,
+    [
+      { x: pigX - 16 * s, y: pigY - 3 * s },
+      { x: pigX - 21 * s, y: pigY - 7 * s },
+      { x: pigX - 19 * s, y: pigY - 11 * s },
+      { x: pigX - 23 * s, y: pigY - 9 * s },
+    ],
+    { color: inkColor, lineWidth: 1.5 * s, roughness: 0.45, seed: seed + 2, passes: 1 },
+  );
+
+  // Four pig legs with dark hooves
+  const legSwing = Math.sin(tSec * 7.2) * 2.2 * s;
+  const legs = [
+    { x: pigX - 10 * s, dx: legSwing * 0.7 },
+    { x: pigX - 4 * s, dx: -legSwing * 0.6 },
+    { x: pigX + 7 * s, dx: -legSwing * 0.7 },
+    { x: pigX + 12 * s, dx: legSwing * 0.8 },
+  ];
+  for (let i = 0; i < legs.length; i++) {
+    const lx = legs[i].x;
+    const ly = pigY + 8 * s;
+    const fx = lx + legs[i].dx;
+    const fy = cy + 29 * s;
+    drawSketchLine(ctx, lx, ly, fx, fy, {
+      color: inkColor,
+      lineWidth: 1.75 * s,
+      roughness: 0.4,
+      seed: seed + 10 + i,
+      passes: 1,
+    });
+    drawSketchLine(ctx, fx - 1.5 * s, fy, fx + 2.2 * s, fy, {
+      color: '#451A03',
+      lineWidth: 2.3 * s,
+      roughness: 0.25,
+      seed: seed + 20 + i,
+      passes: 1,
+    });
+  }
+
+  // Pig snout + nostrils + ear + eye
+  const snoutX = pigX + 20.5 * s;
+  const snoutY = pigY - 1.5 * s;
+  ctx.save();
+  ctx.fillStyle = 'rgba(244, 114, 182, 0.22)';
+  ctx.beginPath();
+  ctx.ellipse(snoutX, snoutY, 4.2 * s, 5.2 * s, 0, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.restore();
+  drawSketchCircle(ctx, snoutX, snoutY, 4.4 * s, {
+    color: inkColor,
+    lineWidth: 1.6 * s,
+    roughness: 0.4,
+    seed: seed + 30,
+    passes: 1,
+  });
+  ctx.save();
+  ctx.fillStyle = inkColor;
+  ctx.beginPath();
+  ctx.arc(snoutX - 0.8 * s, snoutY - 1.1 * s, 0.9 * s, 0, Math.PI * 2);
+  ctx.arc(snoutX + 1.2 * s, snoutY - 0.7 * s, 0.9 * s, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.restore();
+
+  // Pig ear
+  drawSketchPolyline(
+    ctx,
+    [
+      { x: pigX + 10 * s, y: pigY - 9.5 * s },
+      { x: pigX + 13.5 * s, y: pigY - 15.5 * s },
+      { x: pigX + 16 * s, y: pigY - 8 * s },
+    ],
+    { color: inkColor, lineWidth: 1.5 * s, roughness: 0.4, seed: seed + 31, passes: 1 },
+  );
+  // Pig eye
+  ctx.save();
+  ctx.fillStyle = inkColor;
+  ctx.beginPath();
+  ctx.arc(pigX + 13.5 * s, pigY - 5 * s, 1.3 * s, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.restore();
+
+  // Saddle strap on pig back
+  drawSketchPolyline(
+    ctx,
+    [
+      { x: pigX - 5 * s, y: pigY - 10.5 * s },
+      { x: pigX - 4 * s, y: pigY - 2 * s },
+      { x: pigX + 3 * s, y: pigY - 2 * s },
+      { x: pigX + 4 * s, y: pigY - 10.5 * s },
+    ],
+    { color: '#92400E', lineWidth: 1.7 * s, roughness: 0.35, seed: seed + 35, passes: 1 },
+  );
+
+  // Rider sitting on saddle (0.8x mini stickman + curved brown helmet)
+  const riderHipX = pigX - 1 * s;
+  const riderHipY = pigY - 10.5 * s + bounce * 0.8;
+  const riderShoulderX = riderHipX + 1.5 * s;
+  const riderShoulderY = riderHipY - 11.5 * s;
+  const riderHeadX = riderShoulderX + 0.5 * s;
+  const riderHeadY = riderShoulderY - 6.5 * s;
+
+  // Rider torso + seated leg gripping pig side
+  drawSketchLine(ctx, riderHipX, riderHipY, riderShoulderX, riderShoulderY, {
+    color: inkColor,
+    lineWidth: 1.7 * s,
+    roughness: 0.4,
+    seed: seed + 40,
+    passes: 2,
+  });
+  drawSketchPolyline(
+    ctx,
+    [
+      { x: riderHipX, y: riderHipY },
+      { x: riderHipX + 5 * s, y: riderHipY + 3.5 * s },
+      { x: riderHipX + 3.5 * s, y: riderHipY + 8.5 * s },
+    ],
+    { color: inkColor, lineWidth: 1.6 * s, roughness: 0.4, seed: seed + 41, passes: 1 },
+  );
+
+  // Rider arm holding taut reins to pig snout
+  const handX = riderShoulderX + 6.5 * s;
+  const handY = riderShoulderY + 4.5 * s;
+  drawSketchLine(ctx, riderShoulderX, riderShoulderY, handX, handY, {
+    color: inkColor,
+    lineWidth: 1.55 * s,
+    roughness: 0.35,
+    seed: seed + 42,
+    passes: 1,
+  });
+  // Taut rein
+  drawSketchLine(ctx, handX, handY, pigX + 15.5 * s, snoutY - 3 * s, {
+    color: '#92400E',
+    lineWidth: 1.35 * s,
+    roughness: 0.25,
+    seed: seed + 43,
+    passes: 1,
+  });
+
+  // Mini spear held upright behind
+  drawSketchLine(ctx, riderShoulderX - 5 * s, riderHipY + 2 * s, riderShoulderX + 9 * s, riderHeadY - 11 * s, {
+    color: '#78350F',
+    lineWidth: 1.5 * s,
+    roughness: 0.3,
+    seed: seed + 44,
+    passes: 1,
+  });
+
+  // Rider head + curved brown helmet (#92400E)
+  drawSketchCircle(ctx, riderHeadX, riderHeadY, 4.8 * s, {
+    color: inkColor,
+    lineWidth: 1.65 * s,
+    roughness: 0.38,
+    seed: seed + 45,
+    passes: 2,
+  });
+  ctx.save();
+  ctx.fillStyle = 'rgba(146, 64, 14, 0.28)';
+  ctx.beginPath();
+  ctx.arc(riderHeadX, riderHeadY - 0.5 * s, 5.5 * s, Math.PI * 1.02, Math.PI * 0.05);
+  ctx.closePath();
+  ctx.fill();
+  ctx.restore();
+  drawSketchPolyline(
+    ctx,
+    [
+      { x: riderHeadX - 5.5 * s, y: riderHeadY - 0.5 * s },
+      { x: riderHeadX - 3.5 * s, y: riderHeadY - 6 * s },
+      { x: riderHeadX + 2.5 * s, y: riderHeadY - 6.2 * s },
+      { x: riderHeadX + 5.8 * s, y: riderHeadY - 0.5 * s },
+      { x: riderHeadX - 5.5 * s, y: riderHeadY - 0.5 * s },
+    ],
+    { color: '#92400E', lineWidth: 1.65 * s, roughness: 0.32, seed: seed + 46, passes: 2 },
+  );
+  // Rider determined dot eye
+  ctx.save();
+  ctx.fillStyle = inkColor;
+  ctx.beginPath();
+  ctx.arc(riderHeadX + 2.2 * s, riderHeadY + 1.2 * s, 0.9 * s, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.restore();
+}
+
 function drawLonSatCardPortrait(
   ctx: CanvasRenderingContext2D,
   cx: number,
@@ -1464,6 +1762,237 @@ function drawHeBongBayCardPortrait(
     { color: '#7C3AED', lineWidth: 2.2 * s, seed: seed + 20, passes: 2 },
   );
   drawSketchCircle(ctx, hatTopX, hatTopY, 3.2 * s, { color: '#F59E0B', lineWidth: 2 * s, seed: seed + 22 });
+}
+
+function drawNinjaCardPortrait(
+  ctx: CanvasRenderingContext2D,
+  cx: number,
+  cy: number,
+  scale: number,
+  inkColor: string,
+  _accentColor: string,
+  boilTick: number,
+  tSec: number,
+) {
+  const s = scale * 0.92;
+  const seed = 680 + boilTick * 11.7;
+  const bob = Math.abs(Math.sin(tSec * 6.5)) * 2.2 * s;
+  const hipX = cx - 2 * s;
+  const hipY = cy + 16 * s - bob * 0.6;
+  const shX = hipX + 6 * s;
+  const shY = hipY - 22 * s;
+  const headX = shX + 2.5 * s;
+  const headY = shY - 12 * s;
+
+  // 3 flowing black headband tails
+  for (let ti = 0; ti < 3; ti++) {
+    const wave = Math.sin(tSec * 7.2 + ti * 1.1) * 2.2 * s;
+    drawSketchPolyline(
+      ctx,
+      [
+        { x: headX - 6 * s, y: headY - 4 * s },
+        { x: headX - 18 * s, y: headY - 6 * s + (ti - 1) * 3.2 * s + wave * 0.5 },
+        { x: headX - 30 * s, y: headY - 3 * s + (ti - 1) * 4.5 * s + wave },
+      ],
+      { color: '#0F172A', lineWidth: 1.5 * s, roughness: 0.45, seed: seed + 1 + ti, passes: 1 },
+    );
+  }
+
+  // Low crouched ninja stance legs
+  drawSketchLine(ctx, hipX, hipY, hipX - 11 * s, hipY + 9 * s, { color: inkColor, lineWidth: 2.1 * s, roughness: 0.45, seed: seed + 5, passes: 1, alpha: 0.78 });
+  drawSketchLine(ctx, hipX - 11 * s, hipY + 9 * s, hipX - 15 * s, hipY + 23 * s, { color: inkColor, lineWidth: 2.1 * s, roughness: 0.45, seed: seed + 6, passes: 1, alpha: 0.78 });
+  drawSketchLine(ctx, hipX, hipY, hipX + 10 * s, hipY + 8 * s, { color: inkColor, lineWidth: 2.1 * s, roughness: 0.45, seed: seed + 7, passes: 1 });
+  drawSketchLine(ctx, hipX + 10 * s, hipY + 8 * s, hipX + 11 * s, hipY + 23 * s, { color: inkColor, lineWidth: 2.1 * s, roughness: 0.45, seed: seed + 8, passes: 1 });
+
+  // Torso + black diagonal sash
+  drawSketchLine(ctx, hipX, hipY, shX, shY, { color: inkColor, lineWidth: 2.3 * s, roughness: 0.45, seed: seed + 9, passes: 1 });
+  drawSketchLine(ctx, shX - 2 * s, shY + 2 * s, hipX + 2.5 * s, hipY - 2 * s, { color: '#0F172A', lineWidth: 2.8 * s, roughness: 0.35, seed: seed + 10, passes: 1 });
+
+  // Purple shuriken peeking out of hip pouch
+  const pouchX = hipX - 5 * s;
+  const pouchY = hipY - 3 * s;
+  drawSketchCircle(ctx, pouchX, pouchY, 3.2 * s, { color: '#0F172A', lineWidth: 1.3 * s, roughness: 0.3, seed: seed + 11, passes: 1 });
+  drawSketchLine(ctx, pouchX - 5 * s, pouchY, pouchX + 5 * s, pouchY, { color: '#7C3AED', lineWidth: 1.7 * s, roughness: 0.25, seed: seed + 12, passes: 1 });
+  drawSketchLine(ctx, pouchX, pouchY - 5 * s, pouchX, pouchY + 5 * s, { color: '#7C3AED', lineWidth: 1.7 * s, roughness: 0.25, seed: seed + 13, passes: 1 });
+
+  // Back arm tucked behind + front low guard arm
+  drawSketchLine(ctx, shX, shY, shX - 10 * s, shY + 7 * s, { color: inkColor, lineWidth: 1.9 * s, roughness: 0.4, seed: seed + 14, passes: 1, alpha: 0.78 });
+  drawSketchLine(ctx, shX, shY, shX + 12 * s, shY + 6 * s, { color: inkColor, lineWidth: 1.9 * s, roughness: 0.4, seed: seed + 15, passes: 1 });
+  drawSketchLine(ctx, shX + 12 * s, shY + 6 * s, shX + 19 * s, shY + 1 * s, { color: inkColor, lineWidth: 1.9 * s, roughness: 0.4, seed: seed + 16, passes: 1 });
+
+  // Head + black headband + triangle mask + purple slanted eye glint
+  const headR = 9.2 * s;
+  drawSketchCircle(ctx, headX, headY, headR, { color: inkColor, lineWidth: 2.1 * s, roughness: 0.42, seed: seed + 18, passes: 1 });
+  drawSketchLine(ctx, headX - headR * 0.95, headY - 3.6 * s, headX + headR * 0.95, headY - 3.6 * s, { color: '#0F172A', lineWidth: 2.9 * s, roughness: 0.3, seed: seed + 19, passes: 1 });
+  drawSketchPolyline(
+    ctx,
+    [
+      { x: headX - headR * 0.85, y: headY + 0.5 * s },
+      { x: headX + 1.5 * s, y: headY + headR * 1.02 },
+      { x: headX + headR * 0.88, y: headY + 0.5 * s },
+      { x: headX - headR * 0.85, y: headY + 0.5 * s },
+    ],
+    { color: '#0F172A', lineWidth: 1.6 * s, roughness: 0.3, seed: seed + 20, passes: 1 },
+  );
+  // Slanted eyes + purple glint
+  drawSketchLine(ctx, headX - 1 * s, headY - 1.4 * s, headX + 2.6 * s, headY - 0.5 * s, { color: '#0F172A', lineWidth: 1.4 * s, roughness: 0.2, seed: seed + 21, passes: 1 });
+  drawSketchLine(ctx, headX + 4.0 * s, headY - 0.5 * s, headX + 7.4 * s, headY - 1.4 * s, { color: '#0F172A', lineWidth: 1.4 * s, roughness: 0.2, seed: seed + 22, passes: 1 });
+  ctx.save();
+  ctx.fillStyle = '#9333EA';
+  ctx.beginPath();
+  ctx.arc(headX + 5.3 * s, headY - 0.7 * s, 1.45 * s, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.restore();
+}
+
+function drawNguoiSoiCardPortrait(
+  ctx: CanvasRenderingContext2D,
+  cx: number,
+  cy: number,
+  scale: number,
+  inkColor: string,
+  _accentColor: string,
+  boilTick: number,
+  tSec: number,
+) {
+  const s = scale * 0.94;
+  const seed = 740 + boilTick * 11.3;
+  const breathe = Math.sin(tSec * 4.2) * 1.3 * s;
+  const hipX = cx - 4 * s;
+  const hipY = cy + 16 * s + breathe * 0.4;
+  const shX = hipX + 5 * s;
+  const shY = hipY - 21 * s + breathe * 0.5;
+  const headX = shX + 3.5 * s;
+  const headY = shY - 12 * s;
+
+  // Bushy wolf tail peeking out behind ragged cloak
+  drawSketchPolyline(
+    ctx,
+    [
+      { x: hipX - 3 * s, y: hipY - 2 * s },
+      { x: hipX - 15 * s, y: hipY - 5 * s },
+      { x: hipX - 24 * s, y: hipY - 14 * s },
+      { x: hipX - 18 * s, y: hipY - 8 * s },
+      { x: hipX - 21 * s, y: hipY - 2 * s },
+      { x: hipX - 9 * s, y: hipY + 1 * s },
+      { x: hipX - 3 * s, y: hipY - 2 * s },
+    ],
+    { color: inkColor, lineWidth: 1.9 * s, roughness: 0.55, seed: seed + 1, passes: 1 },
+  );
+
+  // Hunched wolf stance legs
+  drawSketchLine(ctx, hipX, hipY, hipX - 8 * s, hipY + 11 * s, { color: inkColor, lineWidth: 2.0 * s, roughness: 0.45, seed: seed + 2, passes: 1, alpha: 0.78 });
+  drawSketchLine(ctx, hipX - 8 * s, hipY + 11 * s, hipX - 11 * s, hipY + 23 * s, { color: inkColor, lineWidth: 2.0 * s, roughness: 0.45, seed: seed + 3, passes: 1, alpha: 0.78 });
+  drawSketchLine(ctx, hipX, hipY, hipX + 9 * s, hipY + 10 * s, { color: inkColor, lineWidth: 2.2 * s, roughness: 0.45, seed: seed + 4, passes: 1 });
+  drawSketchLine(ctx, hipX + 9 * s, hipY + 10 * s, hipX + 10 * s, hipY + 23 * s, { color: inkColor, lineWidth: 2.2 * s, roughness: 0.45, seed: seed + 5, passes: 1 });
+
+  // Ragged plaid cloak drape behind torso
+  const cloakPts = [
+    { x: shX - 4 * s, y: shY - 3 * s },
+    { x: hipX - 14 * s, y: hipY + 8 * s },
+    { x: hipX - 7 * s, y: hipY + 4 * s },
+    { x: hipX - 2 * s, y: hipY + 9 * s },
+    { x: hipX + 4 * s, y: hipY + 3 * s },
+    { x: shX + 3 * s, y: shY + 2 * s },
+  ];
+  ctx.save();
+  ctx.fillStyle = inkColor;
+  ctx.globalAlpha = 0.14;
+  ctx.beginPath();
+  ctx.moveTo(cloakPts[0].x, cloakPts[0].y);
+  for (let i = 1; i < cloakPts.length; i++) ctx.lineTo(cloakPts[i].x, cloakPts[i].y);
+  ctx.closePath();
+  ctx.fill();
+  ctx.restore();
+  drawSketchPolyline(ctx, cloakPts, { color: inkColor, lineWidth: 1.9 * s, roughness: 0.5, seed: seed + 6, passes: 1 });
+  // Plaid check lines on cloak
+  drawSketchLine(ctx, shX - 6 * s, shY + 7 * s, hipX + 1 * s, shY + 9 * s, { color: inkColor, lineWidth: 1.1 * s, roughness: 0.3, seed: seed + 7, passes: 1, alpha: 0.55 });
+  drawSketchLine(ctx, shX - 8 * s, shY + 13 * s, hipX + 2 * s, shY + 15 * s, { color: inkColor, lineWidth: 1.1 * s, roughness: 0.3, seed: seed + 8, passes: 1, alpha: 0.55 });
+  drawSketchLine(ctx, shX - 5 * s, shY + 3 * s, hipX - 9 * s, hipY + 4 * s, { color: inkColor, lineWidth: 1.1 * s, roughness: 0.3, seed: seed + 9, passes: 1, alpha: 0.55 });
+
+  // Torso & forward arms with broken iron wrist cuffs
+  drawSketchLine(ctx, hipX, hipY, shX, shY, { color: inkColor, lineWidth: 2.3 * s, roughness: 0.45, seed: seed + 10, passes: 1 });
+  const rElbX = shX + 10 * s;
+  const rElbY = shY + 8 * s;
+  const rHandX = shX + 18 * s;
+  const rHandY = shY + 4 * s;
+  drawSketchLine(ctx, shX, shY, rElbX, rElbY, { color: inkColor, lineWidth: 2.0 * s, roughness: 0.4, seed: seed + 11, passes: 1 });
+  drawSketchLine(ctx, rElbX, rElbY, rHandX, rHandY, { color: inkColor, lineWidth: 2.0 * s, roughness: 0.4, seed: seed + 12, passes: 1 });
+  // Broken cuff & dangling chain link
+  drawSketchCircle(ctx, rHandX - 2 * s, rHandY + 1 * s, 2.7 * s, { color: '#334155', lineWidth: 1.5 * s, roughness: 0.3, seed: seed + 13, passes: 1 });
+  drawSketchLine(ctx, rHandX - 2 * s, rHandY + 3.7 * s, rHandX - 3 * s, rHandY + 8.5 * s, { color: '#334155', lineWidth: 1.4 * s, roughness: 0.35, seed: seed + 14, passes: 1 });
+
+  // Head + pointed wolf ears poking out of hood + shaggy mane tufts
+  const headR = 9.5 * s;
+  drawSketchCircle(ctx, headX, headY, headR, { color: inkColor, lineWidth: 2.1 * s, roughness: 0.45, seed: seed + 15, passes: 1 });
+  // Pointed wolf ears poking above hood
+  drawSketchPolyline(
+    ctx,
+    [
+      { x: headX - 6 * s, y: headY - headR * 0.78 },
+      { x: headX - 9 * s, y: headY - headR * 1.78 },
+      { x: headX - 1.5 * s, y: headY - headR * 0.98 },
+    ],
+    { color: inkColor, lineWidth: 1.9 * s, roughness: 0.35, seed: seed + 16, passes: 1 },
+  );
+  drawSketchPolyline(
+    ctx,
+    [
+      { x: headX + 0.5 * s, y: headY - headR * 0.96 },
+      { x: headX + 3.5 * s, y: headY - headR * 1.82 },
+      { x: headX + 6.5 * s, y: headY - headR * 0.78 },
+    ],
+    { color: inkColor, lineWidth: 1.9 * s, roughness: 0.35, seed: seed + 17, passes: 1 },
+  );
+  // Hood frame & shaggy mane tufts
+  drawSketchPolyline(
+    ctx,
+    [
+      { x: headX - headR * 1.15, y: headY + 4 * s },
+      { x: headX - headR * 1.05, y: headY - headR * 0.92 },
+      { x: headX + headR * 0.65, y: headY - headR * 1.02 },
+    ],
+    { color: inkColor, lineWidth: 2.1 * s, roughness: 0.48, seed: seed + 18, passes: 1 },
+  );
+  drawSketchPolyline(
+    ctx,
+    [
+      { x: headX - 4 * s, y: headY + headR * 0.85 },
+      { x: headX - 7 * s, y: headY + headR * 1.25 },
+      { x: headX - 1 * s, y: headY + headR * 1.1 },
+      { x: headX + 3 * s, y: headY + headR * 1.28 },
+      { x: headX + 6 * s, y: headY + headR * 0.85 },
+    ],
+    { color: inkColor, lineWidth: 1.6 * s, roughness: 0.4, seed: seed + 19, passes: 1 },
+  );
+
+  // Diagonal cheek scar + glowing yellow eye
+  drawSketchLine(ctx, headX + 0.8 * s, headY + 1.5 * s, headX + 5.8 * s, headY + 4.8 * s, { color: '#DC2626', lineWidth: 1.4 * s, roughness: 0.25, seed: seed + 20, passes: 1 });
+  ctx.save();
+  ctx.fillStyle = '#FACC15';
+  ctx.beginPath();
+  ctx.ellipse(headX + 4.2 * s, headY - 1.2 * s, 2.3 * s, 1.45 * s, -0.15, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.strokeStyle = '#0F172A';
+  ctx.lineWidth = 1.1 * s;
+  ctx.stroke();
+  ctx.restore();
+
+  // Yellow crescent moon badge beside head
+  const moonX = headX + 18.5 * s;
+  const moonY = headY - 8.5 * s;
+  const moonR = 5.4 * s;
+  ctx.save();
+  ctx.fillStyle = '#FACC15';
+  ctx.beginPath();
+  ctx.arc(moonX, moonY, moonR, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = '#FFFDF7';
+  ctx.beginPath();
+  ctx.arc(moonX - moonR * 0.45, moonY - moonR * 0.12, moonR * 0.78, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.restore();
+  drawSketchCircle(ctx, moonX, moonY, moonR, { color: '#0F172A', lineWidth: 1.3 * s, roughness: 0.3, seed: seed + 21, passes: 1 });
 }
 
 export const CHARACTERS: Record<CharacterId, CharacterDef> = {
@@ -2055,6 +2584,374 @@ export const CHARACTERS: Record<CharacterId, CharacterDef> = {
     },
     drawPortrait: drawHeBongBayCardPortrait,
   },
+
+  ninja: {
+    id: 'ninja',
+    name: 'Ninja',
+    subtitle: 'Bóng lướt mép giấy',
+    description: 'Nhanh nhẹn, giữ kiếm sắc bén; bị ép góc 2 đòn liền sẽ nhảy qua đầu đối thủ và phóng phi tiêu.',
+    scale: 0.9,
+    limbLength: 1,
+    lineWidth: 1.1,
+    hitbox: 0.8,
+    jitterFps: 10,
+    hp: 0.75,
+    moveSpeed: 1.2,
+    damageDealt: 0.9,
+    knockbackDealt: 0.75,
+    knockbackTaken: 1.25,
+    phaseTime: { windup: 0.8, strike: 0.85, recovery: 1.1 },
+    trait: {
+      id: 'escapeLeap',
+      cooldown: 8.0,
+      nearEdge: 60,
+      minConsecutiveHits: 2,
+      needsLandingRoom: true,
+      leap: {
+        duration: 0.62,
+        landDistance: 190,
+        arcHeight: 165,
+        clearsComboQueue: true,
+        invulnerable: false,
+      },
+      shuriken: {
+        damage: 7,
+        knockback: 0,
+        hitOnce: true,
+        blockable: true,
+        throwAt: 'leapApex',
+      },
+      ignores: ['knockdown', 'getup', 'pinned', 'homeRun', 'noLandingRoom'],
+      finale: {
+        belowHp: 0.3,
+        oncePerMatch: true,
+        aiOnly: true,
+      },
+    },
+    affinity: {
+      sword: 'strong',
+      unarmed: 'good',
+      spear: 'neutral',
+      bat: 'neutral',
+      hammer: 'weak',
+      shield: 'weak',
+    },
+    ai: {
+      style: 'skirmisher',
+      preferredRange: 0.6,
+      aggression: 0.55,
+      holdInPlaceBounce: true,
+      avoidEdgeWhenTraitCooling: true,
+      waitBelowHp: 0.3,
+    },
+    visual: {
+      bellyScale: 0,
+      headScale: 0.95,
+      torsoRatio: 1.0,
+      neckRatio: 1,
+      legRatio: 1.05,
+      armRatio: 1.05,
+      fistScale: 0.9,
+      shoeScale: 0,
+      footFlat: false,
+      kneeKnobs: false,
+      beard: false,
+      hairTufts: 0,
+      hairStrands: 0,
+      glasses: false,
+      cheekBandage: false,
+      faceStyle: 'ninja',
+      scarfStyle: 'headband',
+      scarfColor: '#0F172A',
+      scarfTailLines: 3,
+      sockStripes: 0,
+      jitterFps: 10,
+      doublePasses: 1,
+      secondPassOffsetY: 0,
+      waveAmp: 0,
+      doubleStrokeRoughness: 0.48,
+      shadowAlpha: 0.14,
+      stepShake: 0,
+      swordDrawScale: 1.1,
+      batDrawScale: 0.98,
+      spearDrawScale: 0.96,
+      hammerDrawScale: 1.0,
+      shieldDrawScale: 0.9,
+      ninjaLook: true,
+    },
+    statTags: ['225 Máu', 'Nhảy Thoát Góc', 'Kiếm & Tay không'],
+    entrance: {
+      duration: 0.42,
+      jumpHeight: 138,
+      tauntDuration: 0.66,
+      tauntText: 'XOẸT!',
+      tauntStyle: 'ninja_hand_seal',
+    },
+    drawPortrait: drawNinjaCardPortrait,
+  },
+  kysilon: {
+    id: 'kysilon',
+    name: 'Kỵ Sĩ Lợn',
+    subtitle: 'Cưỡi Heo Chiến',
+    description:
+      'Cưỡi lợn lao thẳng vào đối thủ. Khi bị đánh gục xuống dưới 40% máu sẽ đứt cương tách làm đôi: lợn húc tuyến đầu, kỵ sĩ giữ khoảng cách bọc sau.',
+    scale: 0.8,
+    limbLength: 1.0,
+    lineWidth: 1.2,
+    hitbox: 1.3,
+    jitterFps: 8,
+    hp: 1.15,
+    moveSpeed: 1.1,
+    damageDealt: 0.95,
+    knockbackDealt: 1.1,
+    knockbackTaken: 0.75,
+    phaseTime: { windup: 1.1, strike: 1.0, recovery: 1.15 },
+    trait: {
+      id: 'pigMount',
+      splitBelowHp: 0.4,
+      splitOnKnockdown: true,
+      splitOnThrownShield: true,
+    },
+    affinity: {
+      unarmed: 'strong',
+      spear: 'good',
+      sword: 'neutral',
+      bat: 'neutral',
+      hammer: 'weak',
+      shield: 'weak',
+    },
+    ai: {
+      style: 'gladiatorRider',
+      preferredRange: 0.7,
+      aggression: 0.65,
+      holdInPlaceBounce: true,
+      holdBelowHp: 0.3,
+      pigHeadbuttCooldown: 3.2,
+    },
+    visual: {
+      bellyScale: 0,
+      headScale: 0.95,
+      torsoRatio: 0.96,
+      neckRatio: 1,
+      legRatio: 0.96,
+      armRatio: 1.0,
+      fistScale: 0.92,
+      shoeScale: 0.85,
+      footFlat: false,
+      kneeKnobs: false,
+      beard: false,
+      hairTufts: 0,
+      hairStrands: 0,
+      glasses: false,
+      cheekBandage: false,
+      faceStyle: 'kysilon',
+      scarfStyle: 'none',
+      scarfTailLines: 0,
+      sockStripes: 0,
+      jitterFps: 8,
+      doublePasses: 2,
+      secondPassOffsetY: 0,
+      waveAmp: 0,
+      doubleStrokeRoughness: 0.52,
+      shadowAlpha: 0.16,
+      stepShake: 0,
+      swordDrawScale: 0.95,
+      batDrawScale: 0.95,
+      spearDrawScale: 0.98,
+      hammerDrawScale: 0.92,
+      shieldDrawScale: 0.9,
+      pigRiderLook: true,
+      brownHelmet: true,
+    },
+    statTags: ['345 Máu', 'Đứt Cương Tách Đôi', 'Tay Không & Giáo'],
+    entrance: {
+      duration: 0.56,
+      jumpHeight: 118,
+      tauntDuration: 0.68,
+      tauntText: 'ỤT ỊT!',
+      tauntStyle: 'kysilon_oink',
+    },
+    drawPortrait: drawKySiLonCardPortrait,
+  },
+  lon: {
+    id: 'lon',
+    name: 'Lợn Chiến',
+    subtitle: 'Heo Tuyến Đầu',
+    description: 'Lao thẳng về phía trước, húc đầu, giậm chân và hích nhẹ không bao giờ lùi bước.',
+    scale: 0.8,
+    limbLength: 1.0,
+    lineWidth: 1.25,
+    hitbox: 1.2,
+    jitterFps: 8,
+    hp: 0.575,
+    moveSpeed: 1.2,
+    damageDealt: 1.0,
+    knockbackDealt: 1.3,
+    knockbackTaken: 0.75,
+    phaseTime: { windup: 1.0, strike: 0.9, recovery: 1.2 },
+    trait: {
+      id: 'pigCompanion',
+      neverEquipWeapon: true,
+    },
+    affinity: {
+      unarmed: 'strong',
+      sword: 'weak',
+      bat: 'weak',
+      spear: 'weak',
+      hammer: 'weak',
+      shield: 'weak',
+    },
+    ai: {
+      style: 'frontliner',
+      preferredRange: 0.5,
+      aggression: 0.9,
+    },
+    visual: {
+      bellyScale: 0,
+      headScale: 1.0,
+      torsoRatio: 1.0,
+      neckRatio: 1,
+      legRatio: 1.0,
+      armRatio: 1.0,
+      fistScale: 1.0,
+      shoeScale: 0,
+      footFlat: false,
+      kneeKnobs: false,
+      beard: false,
+      hairTufts: 0,
+      hairStrands: 0,
+      glasses: false,
+      cheekBandage: false,
+      faceStyle: 'lon',
+      scarfStyle: 'none',
+      scarfTailLines: 0,
+      sockStripes: 0,
+      jitterFps: 8,
+      doublePasses: 2,
+      secondPassOffsetY: 0,
+      waveAmp: 0,
+      doubleStrokeRoughness: 0.52,
+      shadowAlpha: 0.16,
+      stepShake: 0,
+      swordDrawScale: 1.0,
+      batDrawScale: 1.0,
+      spearDrawScale: 1.0,
+      hammerDrawScale: 1.0,
+      shieldDrawScale: 1.0,
+      pigLook: true,
+    },
+    statTags: ['Lao Húc Đầu', 'Không Lùi Bước'],
+    entrance: {
+      duration: 0.35,
+      jumpHeight: 60,
+      tauntDuration: 0.45,
+      tauntText: 'ÉC!',
+      tauntStyle: 'kysilon_oink',
+    },
+    drawPortrait: drawKySiLonCardPortrait,
+  },
+  nguoisoi: {
+    id: 'nguoisoi',
+    name: 'Người Sói',
+    subtitle: 'Ác Thú Trăng Tròn',
+    description:
+      'Gây sát thương tích trăng (0-80). Đủ 80 điểm tự động gầm hú biến hình 8 giây thành Sói Khổng Lồ hung hãn, cất vũ khí và cào xé áp đảo bằng tay không.',
+    scale: 1.0,
+    limbLength: 1.0,
+    lineWidth: 1.0,
+    hitbox: 1.0,
+    jitterFps: 8,
+    hp: 0.9,
+    moveSpeed: 1.0,
+    damageDealt: 0.85,
+    knockbackDealt: 0.9,
+    knockbackTaken: 1.0,
+    phaseTime: { windup: 1.0, strike: 1.0, recovery: 1.0 },
+    trait: {
+      id: 'moonForm',
+      moonForm: {
+        maxGauge: 80,
+        gainPerDamage: 1,
+        excludes: ['shieldThrow'],
+        transformDuration: 0.5,
+        transformAction: 'TAUNT',
+        transformInterruptible: true,
+        drainDuration: 8.0,
+        weaponStashOnTransform: true,
+        wolfStats: {
+          scale: 1.1,
+          hitbox: 1.15,
+          lineWidth: 1.3,
+          jitterFps: 12,
+          moveSpeed: 1.3,
+          damageDealt: 1.25,
+          knockbackDealt: 1.1,
+          knockbackTaken: 0.9,
+          phaseTime: { windup: 0.85, strike: 0.9, recovery: 1.0 },
+        },
+      },
+    },
+    affinity: {
+      unarmed: 'strong',
+      spear: 'good',
+      sword: 'neutral',
+      bat: 'neutral',
+      hammer: 'weak',
+      shield: 'weak',
+    },
+    ai: {
+      style: 'moonHunter',
+      preferredRange: 0.75,
+      aggression: 0.5,
+      aggressionByForm: { human: 0.5, wolf: 0.85 },
+      pushWhenMoonHalfFull: true,
+      holdBelowHp: 0.3,
+    },
+    visual: {
+      bellyScale: 0,
+      headScale: 1.0,
+      torsoRatio: 1.0,
+      neckRatio: 1.0,
+      legRatio: 1.0,
+      armRatio: 1.0,
+      fistScale: 1.05,
+      shoeScale: 0,
+      footFlat: false,
+      kneeKnobs: false,
+      beard: false,
+      hairTufts: 2,
+      hairStrands: 0,
+      glasses: false,
+      cheekBandage: false,
+      faceStyle: 'nguoisoi',
+      scarfStyle: 'none',
+      scarfTailLines: 0,
+      sockStripes: 0,
+      jitterFps: 8,
+      doublePasses: 2,
+      secondPassOffsetY: 0,
+      waveAmp: 0,
+      doubleStrokeRoughness: 0.68,
+      shadowAlpha: 0.24,
+      stepShake: 0,
+      swordDrawScale: 1.0,
+      batDrawScale: 1.0,
+      spearDrawScale: 1.0,
+      hammerDrawScale: 1.0,
+      shieldDrawScale: 0.95,
+      wolfLook: true,
+      moonIcon: true,
+    },
+    statTags: ['270 Máu', 'Hóa Sói Trăng Tròn', 'Tay Không & Giáo'],
+    entrance: {
+      duration: 0.48,
+      jumpHeight: 132,
+      tauntDuration: 0.72,
+      tauntText: 'ÚÚÚ!',
+      tauntStyle: 'howl',
+    },
+    drawPortrait: drawNguoiSoiCardPortrait,
+  },
 };
 
 export const CHARACTER_LIST: CharacterDef[] = [
@@ -2064,6 +2961,9 @@ export const CHARACTER_LIST: CharacterDef[] = [
   CHARACTERS.caokieu,
   CHARACTERS.lonsat,
   CHARACTERS.hebongbay,
+  CHARACTERS.ninja,
+  CHARACTERS.kysilon,
+  CHARACTERS.nguoisoi,
 ];
 
 export function getCharacterDef(id: CharacterId): CharacterDef {

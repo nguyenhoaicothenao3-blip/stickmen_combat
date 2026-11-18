@@ -25,16 +25,19 @@ import {
 import {
   createDrawnWeaponFromStroke,
   createThrownShield,
+  createThrownShuriken,
   drawFallingWeapon,
   drawHeldShield,
   drawHeldWeapon,
   drawPaperTear,
   drawPinnedSpear,
   drawThrownShield,
+  drawThrownShuriken,
   DrawnWeapon,
   PaperTear,
   PinnedSpear,
   ThrownShield,
+  ThrownShuriken,
   WEAPON_LIST,
   WEAPONS,
   WeaponType,
@@ -108,8 +111,15 @@ interface BananaPeelTrap {
   maxLife: number;
   ownerSide: FighterSide;
   affectsOwner: boolean;
-  insideLeft: boolean;
-  insideRight: boolean;
+  insideUnitIds: Set<number>;
+  seed: number;
+}
+
+interface SnappedReinDoodle {
+  side: FighterSide;
+  x1: number;
+  x2: number;
+  y: number;
   seed: number;
 }
 
@@ -222,6 +232,9 @@ export const PaperArena: React.FC = () => {
   const paperRef = useRef<PaperCache | null>(null);
   const leftFighterRef = useRef<StickFighter | null>(null);
   const rightFighterRef = useRef<StickFighter | null>(null);
+  const leftCompanionRef = useRef<StickFighter | null>(null);
+  const rightCompanionRef = useRef<StickFighter | null>(null);
+  const snappedReinsRef = useRef<SnappedReinDoodle[]>([]);
   const draggedFighterRef = useRef<StickFighter | null>(null);
   const activePointerIdRef = useRef<number | null>(null);
   const lastMoveTimeRef = useRef<number>(performance.now());
@@ -230,6 +243,7 @@ export const PaperArena: React.FC = () => {
   const drawingStrokeRef = useRef<Array<{ x: number; y: number }> | null>(null);
   const drawnWeaponsRef = useRef<DrawnWeapon[]>([]);
   const thrownShieldsRef = useRef<ThrownShield[]>([]);
+  const thrownShurikensRef = useRef<ThrownShuriken[]>([]);
   const paperTearsRef = useRef<PaperTear[]>([]);
   const pinnedSpearsRef = useRef<PinnedSpear[]>([]);
 
@@ -333,27 +347,29 @@ export const PaperArena: React.FC = () => {
   }, []);
 
   const findTargetFighterAt = useCallback((x: number, y: number): StickFighter | null => {
-    const left = leftFighterRef.current;
-    const right = rightFighterRef.current;
-    if (!left || !right) return null;
+    const candidates = [
+      leftFighterRef.current,
+      leftCompanionRef.current,
+      rightFighterRef.current,
+      rightCompanionRef.current,
+    ].filter(
+      (f): f is StickFighter =>
+        f !== null && !f.characterDef.trait.neverEquipWeapon && f.hp > 0 && f.action !== 'KO',
+    );
+    if (candidates.length === 0) return null;
 
-    const distTo = (f: StickFighter) => {
+    let best: StickFighter | null = null;
+    let bestDist = Infinity;
+    for (const f of candidates) {
       const cx = (f.joints.hip.x + f.joints.head.x) * 0.5;
       const cy = (f.joints.hip.y + f.joints.head.y) * 0.5;
-      return Math.hypot(x - cx, y - cy);
-    };
-
-    const threshL = 92 * left.hitboxScale;
-    const threshR = 92 * right.hitboxScale;
-    const dL = distTo(left);
-    const dR = distTo(right);
-
-    if (dL <= threshL && dR <= threshR) {
-      return dL <= dR ? left : right;
+      const d = Math.hypot(x - cx, y - cy);
+      if (d <= 92 * f.hitboxScale && d < bestDist) {
+        bestDist = d;
+        best = f;
+      }
     }
-    if (dL <= threshL) return left;
-    if (dR <= threshR) return right;
-    return null;
+    return best;
   }, []);
 
   const handleSelectCharacter = useCallback(
@@ -378,6 +394,7 @@ export const PaperArena: React.FC = () => {
       if (phaseRef.current !== 'IDLE') {
         winnerRef.current = null;
         thrownShieldsRef.current = [];
+        thrownShurikensRef.current = [];
         paperTearsRef.current = [];
         pinnedSpearsRef.current = [];
         drawnWeaponsRef.current = [];
@@ -388,13 +405,17 @@ export const PaperArena: React.FC = () => {
         bananaPeelsRef.current = [];
         flyingPiesRef.current = [];
         jackBoxesRef.current = [];
+        snappedReinsRef.current = [];
+        leftCompanionRef.current = null;
+        rightCompanionRef.current = null;
         autoEnterTimerRef.current = null;
         syncPhase('IDLE');
       }
 
       const otherSide: FighterSide = selectingSide === 'left' ? 'right' : 'left';
       const otherFighter = otherSide === 'left' ? leftFighterRef.current : rightFighterRef.current;
-      if (otherFighter && (otherFighter.hasBeenPulledOut || otherFighter.hp < otherFighter.maxHp)) {
+      const otherCompanion = otherSide === 'left' ? leftCompanionRef.current : rightCompanionRef.current;
+      if (otherFighter && (otherFighter.hasBeenPulledOut || otherFighter.hp < otherFighter.maxHp || otherCompanion)) {
         const otherTargetX = otherSide === 'left' ? leftX : rightX;
         const freshOther = new StickFighter(
           otherSide,
@@ -405,8 +426,10 @@ export const PaperArena: React.FC = () => {
         );
         if (otherSide === 'left') {
           leftFighterRef.current = freshOther;
+          leftCompanionRef.current = null;
         } else {
           rightFighterRef.current = freshOther;
+          rightCompanionRef.current = null;
         }
       }
 
@@ -415,9 +438,12 @@ export const PaperArena: React.FC = () => {
 
       if (selectingSide === 'left') {
         leftFighterRef.current = fighter;
+        leftCompanionRef.current = null;
       } else {
         rightFighterRef.current = fighter;
+        rightCompanionRef.current = null;
       }
+      snappedReinsRef.current = snappedReinsRef.current.filter((sr) => sr.side !== selectingSide);
 
       // Ink card-burst particles where the character springs out of the card
       const teamAccent = selectingSide === 'left' ? '#2563EB' : '#DC2626';
@@ -501,6 +527,9 @@ export const PaperArena: React.FC = () => {
       rightFighterRef.current = null;
     }
 
+    leftCompanionRef.current = null;
+    rightCompanionRef.current = null;
+    snappedReinsRef.current = [];
     particlesRef.current = [];
     calloutsRef.current = [];
     trailsRef.current = [];
@@ -514,6 +543,7 @@ export const PaperArena: React.FC = () => {
     jackBoxesRef.current = [];
     drawnWeaponsRef.current = [];
     thrownShieldsRef.current = [];
+    thrownShurikensRef.current = [];
     paperTearsRef.current = [];
     pinnedSpearsRef.current = [];
     drawingStrokeRef.current = null;
@@ -660,6 +690,12 @@ export const PaperArena: React.FC = () => {
           rightFighterRef.current.y = rendered.floorY;
         }
       }
+
+      for (const comp of [leftCompanionRef.current, rightCompanionRef.current]) {
+        if (!comp) continue;
+        comp.setArenaScale(scale);
+        comp.x = Math.max(minX, Math.min(maxX, comp.x));
+      }
     };
 
     rebuildPaper();
@@ -673,25 +709,69 @@ export const PaperArena: React.FC = () => {
     let rafId = 0;
     let lastTime = performance.now();
 
+    const getTeamUnits = (side: FighterSide): StickFighter[] => {
+      const units: StickFighter[] = [];
+      const primary = side === 'left' ? leftFighterRef.current : rightFighterRef.current;
+      const companion = side === 'left' ? leftCompanionRef.current : rightCompanionRef.current;
+      if (primary) units.push(primary);
+      if (companion) units.push(companion);
+      return units;
+    };
+
+    const getAliveTeamUnits = (side: FighterSide): StickFighter[] =>
+      getTeamUnits(side).filter((u) => u.hp > 0 && u.action !== 'KO');
+
+    const isTeamDefeated = (side: FighterSide): boolean => {
+      const units = getTeamUnits(side);
+      return units.length > 0 && units.every((u) => u.hp <= 0);
+    };
+
+    const pickNearestTarget = (
+      unit: StickFighter,
+      enemies: StickFighter[],
+      fallback: StickFighter,
+    ): StickFighter => {
+      const alive = enemies.filter((e) => e.hp > 0 && e.action !== 'KO');
+      if (alive.length === 0) return fallback;
+      let best = alive[0];
+      let bestDist = Math.abs(best.x - unit.x);
+      for (let i = 1; i < alive.length; i++) {
+        const cand = alive[i];
+        const d = Math.abs(cand.x - unit.x);
+        if (d < bestDist - 2 || (Math.abs(d - bestDist) <= 2 && cand.characterId === 'lon' && best.characterId !== 'lon')) {
+          best = cand;
+          bestDist = d;
+        }
+      }
+      return best;
+    };
+
     const checkKO = (defender: StickFighter, attackerSide: 'left' | 'right') => {
       if (defender.hp <= 0 && phaseRef.current === 'FIGHTING') {
-        syncPhase('KO');
-        winnerRef.current = attackerSide;
-        shakeRef.current = 8;
-        hitstopRef.current = 0.075;
-        sfx.playKO();
+        if (isTeamDefeated(defender.side)) {
+          syncPhase('KO');
+          winnerRef.current = attackerSide;
+          shakeRef.current = 8;
+          hitstopRef.current = 0.075;
+          sfx.playKO();
+        } else {
+          // One unit of a multi-unit side fell; match keeps running!
+          shakeRef.current = Math.max(shakeRef.current, 5);
+          hitstopRef.current = Math.max(hitstopRef.current, 0.04);
+          sfx.playHit(true);
+        }
       }
     };
 
     const checkAttackHit = (
       attacker: StickFighter,
-      defender: StickFighter,
+      defenders: StickFighter[],
       minX: number,
       maxX: number,
     ) => {
-      if (attacker.hasHitThisAction || attacker.isDragged || defender.isDragged) return;
-      if (defender.hp <= 0 || defender.action === 'KO' || defender.action === 'KNOCKDOWN') return;
-      if (defender.isAirborne()) return;
+      const isMultiSweep = attacker.action === 'SWORD_3' || attacker.action === 'HAMMER_2';
+      if (!isMultiSweep && attacker.hasHitThisAction) return;
+      if (attacker.isDragged) return;
 
       const spec = attacker.getAttackSpecs();
       if (!spec) return;
@@ -713,136 +793,144 @@ export const PaperArena: React.FC = () => {
         const t = Math.max(0, Math.min(1, ((px - ax) * vx + (py - ay) * vy) / lenSq));
         return Math.hypot(px - (ax + vx * t), py - (ay + vy * t));
       };
-      const midFootX = (defender.joints.footL.x + defender.joints.footR.x) * 0.5;
-      const midFootY = (defender.joints.footL.y + defender.joints.footR.y) * 0.5;
-      const distToUpper = pointToSeg(
-        tip.x,
-        tip.y,
-        defender.joints.head.x,
-        defender.joints.head.y,
-        defender.joints.hip.x,
-        defender.joints.hip.y,
-      );
-      const distToLegs = pointToSeg(
-        tip.x,
-        tip.y,
-        defender.joints.hip.x,
-        defender.joints.hip.y,
-        midFootX,
-        midFootY,
-      );
-      const hitRadius = spec.reach + 20 * defender.hitboxScale;
 
-      if (Math.min(distToUpper, distToLegs) <= hitRadius) {
-        if (defender.action === 'ROLL_DODGE' || defender.rollInvulnTimer > 0) {
-          attacker.hasHitThisAction = true;
-          return;
-        }
-        if (defender.tryTriggerRollDodge(attacker, minX, maxX)) {
-          return;
-        }
+      for (const defender of defenders) {
+        if (!isMultiSweep && attacker.hasHitThisAction) break;
+        if (attacker.hitTargetsThisAction.has(defender.instanceId)) continue;
+        if (defender.isDragged || defender.hp <= 0 || defender.action === 'KO' || defender.action === 'KNOCKDOWN') continue;
+        if (defender.isAirborne()) continue;
 
-        attacker.hasHitThisAction = true;
+        const midFootX = (defender.joints.footL.x + defender.joints.footR.x) * 0.5;
+        const midFootY = (defender.joints.footL.y + defender.joints.footR.y) * 0.5;
+        const distToUpper = pointToSeg(
+          tip.x,
+          tip.y,
+          defender.joints.head.x,
+          defender.joints.head.y,
+          defender.joints.hip.x,
+          defender.joints.hip.y,
+        );
+        const distToLegs = pointToSeg(
+          tip.x,
+          tip.y,
+          defender.joints.hip.x,
+          defender.joints.hip.y,
+          midFootX,
+          midFootY,
+        );
+        const hitRadius = spec.reach + 20 * defender.hitboxScale;
 
-        if (defender.action === 'DODGE_BACK') {
-          sfx.playDodge();
-          if (spec.longRecovery) {
-            // Dodged a slow heavy hammer swing -> immediate punish counter window!
-            defender.aiCooldown = 0;
+        if (Math.min(distToUpper, distToLegs) <= hitRadius) {
+          if (defender.action === 'ROLL_DODGE' || defender.rollInvulnTimer > 0) {
+            attacker.hitTargetsThisAction.add(defender.instanceId);
+            if (!isMultiSweep) attacker.hasHitThisAction = true;
+            continue;
           }
-          calloutsRef.current.push({
-            x: defender.joints.head.x,
-            y: defender.joints.head.y - 24 * defender.scale,
-            vy: -42,
-            text: spec.longRecovery ? 'NÉ HỞ ĐÒN!' : 'NÉ!',
-            color: defender.accentColor,
-            life: 0.48,
-            maxLife: 0.48,
-            scale: 0.92,
-            tilt: (Math.random() - 0.5) * 0.22,
+          if (defender.tryTriggerRollDodge(attacker, minX, maxX)) {
+            continue;
+          }
+
+          attacker.hitTargetsThisAction.add(defender.instanceId);
+          if (!isMultiSweep) attacker.hasHitThisAction = true;
+
+          if (defender.action === 'DODGE_BACK') {
+            sfx.playDodge();
+            if (spec.longRecovery) {
+              defender.aiCooldown = 0;
+            }
+            calloutsRef.current.push({
+              x: defender.joints.head.x,
+              y: defender.joints.head.y - 24 * defender.scale,
+              vy: -42,
+              text: spec.longRecovery ? 'NÉ HỞ ĐÒN!' : 'NÉ!',
+              color: defender.accentColor,
+              life: 0.48,
+              maxLife: 0.48,
+              scale: 0.92,
+              tilt: (Math.random() - 0.5) * 0.22,
+            });
+            continue;
+          }
+
+          const dir: 1 | -1 = defender.x >= attacker.x ? 1 : -1;
+          const impactX = (tip.x + defender.x) * 0.5;
+          const impactY = Math.max(defender.joints.head.y, Math.min(midFootY, tip.y));
+          const wasGuarding =
+            defender.action === 'BLOCK' || defender.action === 'SHIELD_CROUCH';
+
+          const isFinisher =
+            ['SWORD_3', 'SWORD_LUNGE', 'BAT_3', 'SPEAR_3', 'HAMMER_3'].includes(attacker.action) ||
+            (!attacker.weapon && attacker.comboBeatCount >= 3);
+
+          resolveHit({
+            attacker,
+            defender,
+            rawDamage: spec.damage,
+            kbX: spec.knockbackX * defender.scale,
+            kbY: spec.knockbackY * defender.scale,
+            heavy: spec.heavy,
+            attackerDir: dir,
+            attackType: attacker.action,
+            isFinisher,
+            particles: particlesRef.current,
+            callouts: calloutsRef.current,
+            impactX,
+            impactY,
+            weaponSource: spec.weaponType,
+            minX,
+            maxX,
+            opts: {
+              guardBreak: spec.guardBreak,
+              slow: spec.slow,
+              slowDuration: spec.slowDuration,
+              pin: spec.pin,
+              pinDurationMul: attacker.characterId === 'hebongbay' ? 0.7 : undefined,
+              homeRun: spec.homeRun,
+            },
           });
-          return;
-        }
 
-        const dir: 1 | -1 = defender.x >= attacker.x ? 1 : -1;
-        const impactX = (tip.x + defender.x) * 0.5;
-        const impactY = Math.max(defender.joints.head.y, Math.min(midFootY, tip.y));
-        const wasGuarding =
-          defender.action === 'BLOCK' || defender.action === 'SHIELD_CROUCH';
-
-        const isFinisher =
-          ['SWORD_3', 'SWORD_LUNGE', 'BAT_3', 'SPEAR_3', 'HAMMER_3'].includes(attacker.action) ||
-          (!attacker.weapon && attacker.comboBeatCount >= 3);
-
-        resolveHit({
-          attacker,
-          defender,
-          rawDamage: spec.damage,
-          kbX: spec.knockbackX * defender.scale,
-          kbY: spec.knockbackY * defender.scale,
-          heavy: spec.heavy,
-          attackerDir: dir,
-          attackType: attacker.action,
-          isFinisher,
-          particles: particlesRef.current,
-          callouts: calloutsRef.current,
-          impactX,
-          impactY,
-          weaponSource: spec.weaponType,
-          minX,
-          maxX,
-          opts: {
-            guardBreak: spec.guardBreak,
-            slow: spec.slow,
-            slowDuration: spec.slowDuration,
-            pin: spec.pin,
-            pinDurationMul: attacker.characterId === 'hebongbay' ? 0.7 : undefined,
-            homeRun: spec.homeRun,
-          },
-        });
-
-        if (
-          attacker.characterDef.trait.id === 'sweetSpot' &&
-          attacker.strikeZone === 'sweet' &&
-          !attacker.isIgnoredBySweetSpot(attacker.action)
-        ) {
-          // Crisp ruler tick glint through impact point + small "ĐÚNG TẦM!" callout
-          for (let ri = 0; ri < 2; ri++) {
-            const ang = ri === 0 ? -0.35 : 1.22;
-            particlesRef.current.push({
+          if (
+            attacker.characterDef.trait.id === 'sweetSpot' &&
+            attacker.strikeZone === 'sweet' &&
+            !attacker.isIgnoredBySweetSpot(attacker.action)
+          ) {
+            for (let ri = 0; ri < 2; ri++) {
+              const ang = ri === 0 ? -0.35 : 1.22;
+              particlesRef.current.push({
+                x: impactX,
+                y: impactY,
+                vx: dir * 24,
+                vy: -14,
+                life: 0.24,
+                maxLife: 0.24,
+                size: (ri === 0 ? 22 : 11) * attacker.scale,
+                color: '#0284C7',
+                kind: 'line',
+                angle: ang,
+                spin: 0,
+                seed: Math.random() * 100,
+              });
+            }
+            calloutsRef.current.push({
               x: impactX,
-              y: impactY,
-              vx: dir * 24,
-              vy: -14,
-              life: 0.24,
-              maxLife: 0.24,
-              size: (ri === 0 ? 22 : 11) * attacker.scale,
-              color: '#0284C7',
-              kind: 'line',
-              angle: ang,
-              spin: 0,
-              seed: Math.random() * 100,
+              y: impactY - 40 * defender.scale,
+              vy: -36,
+              text: 'ĐÚNG TẦM!',
+              color: '#0F766E',
+              life: 0.56,
+              maxLife: 0.56,
+              scale: 0.86,
+              tilt: dir * 0.08,
             });
           }
-          calloutsRef.current.push({
-            x: impactX,
-            y: impactY - 40 * defender.scale,
-            vy: -36,
-            text: 'ĐÚNG TẦM!',
-            color: '#0F766E',
-            life: 0.56,
-            maxLife: 0.56,
-            scale: 0.86,
-            tilt: dir * 0.08,
-          });
-        }
 
-        if (!wasGuarding || spec.guardBreak) {
-          shakeRef.current = spec.shake;
-          hitstopRef.current = spec.hitstop;
-        }
+          if (!wasGuarding || spec.guardBreak) {
+            shakeRef.current = Math.max(shakeRef.current, spec.shake);
+            hitstopRef.current = Math.max(hitstopRef.current, spec.hitstop);
+          }
 
-        checkKO(defender, attacker.side);
+          checkKO(defender, attacker.side);
+        }
       }
     };
 
@@ -927,12 +1015,22 @@ export const PaperArena: React.FC = () => {
           })),
         ];
 
-        if (left) {
-          left.activeOwnPeelCount = bananaPeelsRef.current.filter((bp) => bp.ownerSide === 'left').length;
-          left.activeOwnJackBoxCount = jackBoxesRef.current.filter((jb) => jb.ownerSide === 'left').length;
-          left.update(
+        const allUnits: StickFighter[] = [
+          ...getTeamUnits('left'),
+          ...getTeamUnits('right'),
+        ];
+
+        for (const unit of allUnits) {
+          const unitEnemySide: FighterSide = unit.side === 'left' ? 'right' : 'left';
+          const fallbackOpp = unitEnemySide === 'left' ? (left ?? unit) : (right ?? unit);
+          const targetOpp = pickNearestTarget(unit, getTeamUnits(unitEnemySide), fallbackOpp);
+          const allies = getTeamUnits(unit.side).filter((a) => a !== unit);
+          const canEnterVictory = isTeamDefeated(unitEnemySide);
+          unit.activeOwnPeelCount = bananaPeelsRef.current.filter((bp) => bp.ownerSide === unit.side).length;
+          unit.activeOwnJackBoxCount = jackBoxesRef.current.filter((jb) => jb.ownerSide === unit.side).length;
+          unit.update(
             simDt,
-            right ?? left,
+            targetOpp,
             fightingActive,
             minX,
             maxX,
@@ -942,29 +1040,110 @@ export const PaperArena: React.FC = () => {
             tSec,
             looseShieldX,
             arenaTraps,
-          );
-        }
-        if (right) {
-          right.activeOwnPeelCount = bananaPeelsRef.current.filter((bp) => bp.ownerSide === 'right').length;
-          right.activeOwnJackBoxCount = jackBoxesRef.current.filter((jb) => jb.ownerSide === 'right').length;
-          right.update(
-            simDt,
-            left ?? right,
-            fightingActive,
-            minX,
-            maxX,
-            paper.floorY,
-            particlesRef.current,
-            trailsRef.current,
-            tSec,
-            looseShieldX,
-            arenaTraps,
+            allies,
+            canEnterVictory,
           );
         }
 
-        // Entrance landing shockwaves & character-specific intimidation taunts
-        for (const fighter of [left, right]) {
-          if (!fighter) continue;
+        // Entrance landing shockwaves, intimidation taunts, & deterministic Kỵ Sĩ Lợn split-apart
+        for (const fighter of allUnits) {
+          if (fighter.pendingSplitApart) {
+            const sp = fighter.pendingSplitApart;
+            fighter.pendingSplitApart = null;
+            const enemySide: FighterSide = fighter.side === 'left' ? 'right' : 'left';
+            const oppRef = pickNearestTarget(fighter, getTeamUnits(enemySide), fighter);
+
+            const origMax = fighter.maxHp;
+            const hpAfter = Math.max(1, sp.hpAfter);
+            const pigHp = hpAfter >= 2 ? Math.ceil(hpAfter / 2) : 1;
+            const riderHp = hpAfter >= 2 ? hpAfter - pigHp : 0;
+            const pigMaxHp = Math.max(1, Math.ceil(origMax / 2));
+            const riderMaxHp = Math.max(1, origMax - pigMaxHp);
+
+            // Deterministic positioning keeping both rider and pig on the SAME side relative to opponent
+            const dirSign: 1 | -1 = fighter.x >= oppRef.x ? 1 : -1;
+            const sepDist = 70 * fighter.scale;
+            let pigX = Math.max(minX, Math.min(maxX, fighter.x));
+            let riderX = pigX + dirSign * sepDist;
+            if (riderX > maxX) {
+              riderX = maxX;
+              pigX = Math.max(minX, riderX - sepDist);
+            } else if (riderX < minX) {
+              riderX = minX;
+              pigX = Math.min(maxX, riderX + sepDist);
+            }
+            if (oppRef !== fighter && (pigX - oppRef.x) * (riderX - oppRef.x) < 0) {
+              pigX = Math.max(minX, Math.min(maxX, oppRef.x + dirSign * 14 * fighter.scale));
+              riderX = Math.max(minX, Math.min(maxX, pigX + dirSign * sepDist));
+            }
+
+            fighter.x = riderX;
+            fighter.convertToSplitRider(riderHp, riderMaxHp);
+            fighter.vx = sp.kbVx * 0.45;
+            fighter.vy = -125 * fighter.scale;
+            if (riderHp <= 0) {
+              fighter.startAction('KO', 0);
+            } else {
+              fighter.startAction('KNOCKDOWN', 0.48);
+            }
+
+            const pig = new StickFighter(fighter.side, pigX, paper.floorY, scale, 'lon');
+            pig.hp = pigHp;
+            pig.maxHp = pigMaxHp;
+            pig.facing = fighter.facing;
+            pig.hasBeenPulledOut = true;
+            pig.vx = sp.kbVx * 0.25;
+            pig.vy = -90 * pig.scale;
+            pig.startAction('KNOCKDOWN', 0.42);
+            if (fighter.side === 'left') {
+              leftCompanionRef.current = pig;
+            } else {
+              rightCompanionRef.current = pig;
+            }
+
+            snappedReinsRef.current.push({
+              side: fighter.side,
+              x1: Math.min(pigX, riderX),
+              x2: Math.max(pigX, riderX),
+              y: paper.floorY,
+              seed: fighter.seedBase + 77,
+            });
+
+            sfx.playReinSnap();
+            sfx.playPigOink();
+            shakeRef.current = Math.max(shakeRef.current, 6.5);
+            hitstopRef.current = Math.max(hitstopRef.current, 0.045);
+
+            for (let si = 0; si < 8; si++) {
+              const ang = (Math.PI * si) / 7 - Math.PI;
+              const spd = 85 + (si % 3) * 35;
+              particlesRef.current.push({
+                x: (pigX + riderX) * 0.5,
+                y: paper.floorY - 22 * scale,
+                vx: Math.cos(ang) * spd,
+                vy: Math.sin(ang) * spd - 20,
+                life: 0.42,
+                maxLife: 0.42,
+                size: 8 * scale,
+                color: si % 2 === 0 ? '#92400E' : '#F472B6',
+                kind: si % 2 === 0 ? 'line' : 'dust',
+                angle: ang,
+                spin: 3,
+                seed: si * 37,
+              });
+            }
+            calloutsRef.current.push({
+              x: (pigX + riderX) * 0.5,
+              y: paper.floorY - 64 * scale,
+              vy: -36,
+              text: 'ĐỨT CƯƠNG! TÁCH ĐÔI!',
+              color: '#92400E',
+              life: 0.95,
+              maxLife: 0.95,
+              scale: 1.15,
+              tilt: fighter.side === 'left' ? -0.08 : 0.08,
+            });
+          }
           if (fighter.pendingLandingImpact) {
             fighter.pendingLandingImpact = false;
             shakeRef.current = Math.max(shakeRef.current, 3.2);
@@ -1406,6 +1585,12 @@ export const PaperArena: React.FC = () => {
                       ),
                     ];
                 for (const px of placements) {
+                  const insideIds = new Set<number>();
+                  for (const u of [...getTeamUnits('left'), ...getTeamUnits('right')]) {
+                    if (Math.abs(u.x - px) <= peelRadius) {
+                      insideIds.add(u.instanceId);
+                    }
+                  }
                   bananaPeelsRef.current.push({
                     id: gagIdCounterRef.current++,
                     x: px,
@@ -1415,8 +1600,7 @@ export const PaperArena: React.FC = () => {
                     maxLife: 6.0,
                     ownerSide: fighter.side,
                     affectsOwner: true,
-                    insideLeft: Boolean(left && Math.abs(left.x - px) <= peelRadius),
-                    insideRight: Boolean(right && Math.abs(right.x - px) <= peelRadius),
+                    insideUnitIds: insideIds,
                     seed: Math.random() * 400,
                   });
                 }
@@ -1495,409 +1679,379 @@ export const PaperArena: React.FC = () => {
           }
         }
 
+        // Re-collect units in case a split-apart just spawned a companion this frame!
+        const activeAllUnits: StickFighter[] = [
+          ...getTeamUnits('left'),
+          ...getTeamUnits('right'),
+        ];
+
         // Spawn thrown shields, hammer "BỐP!" & paper tears, pinned spears, boiler vent AoE, and home-run wall bounces
         if (left && right) {
-          for (const fighter of [left, right]) {
-            const opp = fighter.side === 'left' ? right : left;
-            const oppSide = opp.side;
+          for (const fighter of activeAllUnits) {
+            const oppSide: FighterSide = fighter.side === 'left' ? 'right' : 'left';
+            const oppUnits = getTeamUnits(oppSide);
+            const opp = pickNearestTarget(fighter, oppUnits, fighter.side === 'left' ? right : left);
 
-          if (fighter.pendingSteamPush) {
-            const sp = fighter.pendingSteamPush;
-            fighter.pendingSteamPush = null;
-            for (let si = 0; si < 4; si++) {
-              particlesRef.current.push({
-                x: sp.x + sp.dir * (6 + si * 5) * fighter.scale,
-                y: sp.y + (si - 1.5) * 4 * fighter.scale,
-                vx: sp.dir * (115 + si * 28),
-                vy: -24 + (si - 1.5) * 18,
-                life: 0.36,
-                maxLife: 0.36,
-                size: (6.5 + si * 1.1) * fighter.scale,
-                color: '#64748B',
-                kind: 'steam',
-                angle: 0,
-                spin: 1,
-                seed: Math.random() * 100,
-              });
-            }
-            const oppDx = opp.x - fighter.x;
-            if (
-              opp.hp > 0 &&
-              !opp.isDragged &&
-              opp.action !== 'KO' &&
-              oppDx * sp.dir >= -12 * fighter.scale &&
-              Math.abs(oppDx) <= 78 * fighter.scale &&
-              Math.abs(opp.y - fighter.y) <= 70 * fighter.scale
-            ) {
-              opp.vx += sp.dir * 135 * opp.scale * opp.characterDef.knockbackTaken;
-            }
-          }
-
-          if (fighter.pendingAreaBlast) {
-            const blast = fighter.pendingAreaBlast;
-            fighter.pendingAreaBlast = null;
-            areaBlastsRef.current.push({
-              x: blast.x,
-              y: blast.y,
-              radius: 14 * fighter.scale,
-              maxRadius: blast.radius,
-              life: 0.38,
-              maxLife: 0.38,
-              color: blast.color,
-              seed: Math.random() * 500,
-            });
-            shakeRef.current = Math.max(shakeRef.current, 11);
-            for (let bi = 0; bi < 14; bi++) {
-              const ang = (Math.PI * 2 * bi) / 14 + (Math.random() - 0.5) * 0.25;
-              const spd = 155 + Math.random() * 145;
-              particlesRef.current.push({
-                x: blast.x + Math.cos(ang) * 14 * fighter.scale,
-                y: blast.y + Math.sin(ang) * 14 * fighter.scale,
-                vx: Math.cos(ang) * spd,
-                vy: Math.sin(ang) * spd - 20,
-                life: 0.44,
-                maxLife: 0.44,
-                size: (bi % 2 === 0 ? 7.5 : 10) * fighter.scale,
-                color: bi % 3 === 0 ? '#64748B' : blast.color,
-                kind: bi % 2 === 0 ? 'steam' : 'spark',
-                angle: ang,
-                spin: 4,
-                seed: Math.random() * 200,
-              });
-            }
-            calloutsRef.current.push({
-              x: blast.x,
-              y: blast.y - 44 * fighter.scale,
-              vy: -42,
-              text: blast.label,
-              color: blast.color,
-              life: 0.68,
-              maxLife: 0.68,
-              scale: 1.32,
-              tilt: (Math.random() - 0.5) * 0.2,
-            });
-
-            // Shatter drawn weapons & pinned spears inside the radial steam blast!
-            const survivedDrawn: DrawnWeapon[] = [];
-            for (const dw of drawnWeaponsRef.current) {
-              if (Math.hypot(dw.x - blast.x, dw.y - blast.y) <= blast.radius + dw.radius) {
-                for (let si = 0; si < 5; si++) {
-                  const ang = (Math.PI * 2 * si) / 5 + Math.random() * 0.5;
-                  particlesRef.current.push({
-                    x: dw.x,
-                    y: dw.y,
-                    vx: Math.cos(ang) * 135,
-                    vy: Math.sin(ang) * 135 - 30,
-                    life: 0.3,
-                    maxLife: 0.3,
-                    size: 9 * scale,
-                    color: '#475569',
-                    kind: 'line',
-                    angle: ang,
-                    spin: 6,
-                    seed: Math.random() * 150,
-                  });
-                }
-              } else {
-                survivedDrawn.push(dw);
-              }
-            }
-            drawnWeaponsRef.current = survivedDrawn;
-
-            pinnedSpearsRef.current = pinnedSpearsRef.current.filter(
-              (ps) => Math.hypot(ps.x - blast.x, ps.y - blast.y) > blast.radius,
-            );
-            if (opp.action === 'PINNED' && Math.hypot(opp.x - blast.x, opp.y - blast.y) <= blast.radius + 24 * opp.hitboxScale) {
-              opp.startAction('STANCE', 0);
-            }
-
-            const oppCenterX = opp.x;
-            const oppCenterY = (opp.joints.hip.y + opp.joints.head.y) * 0.5;
-            if (
-              opp.hp > 0 &&
-              !opp.isDragged &&
-              opp.action !== 'KO' &&
-              Math.hypot(oppCenterX - blast.x, oppCenterY - blast.y) <= blast.radius + 20 * opp.hitboxScale
-            ) {
-              // Clear launched momentum so the blast blasts cleanly from its center
-              opp.homeRunTimer = 0;
-              opp.bodySpinRate = 0;
-              opp.isRecoverySliding = false;
-              const blastDir: 1 | -1 = opp.x >= blast.x ? 1 : -1;
-              let kbX = 340 * blast.knockbackMult * opp.scale;
-              let kbY = -220 * blast.knockbackMult * opp.scale;
-              if (blast.knockbackDistanceR && blast.knockbackDistanceR > 0) {
-                const desiredDist = blast.knockbackDistanceR * (blast.weaponReach ?? fighter.getWeaponReach());
-                kbY = -340 * opp.scale;
-                kbX = (desiredDist / 0.62) / Math.max(0.55, opp.characterDef.knockbackTaken);
-              }
-              resolveHit({
-                attacker: fighter,
-                defender: opp,
-                rawDamage: blast.damage,
-                kbX,
-                kbY,
-                heavy: true,
-                attackerDir: blastDir,
-                attackType: blast.attackType ?? 'BOILER_VENT',
-                isAoe: true,
-                dodgeable: blast.dodgeable,
-                breaksCombo: blast.breaksCombo,
-                exceptArmored: blast.exceptArmored,
-                particles: particlesRef.current,
-                callouts: calloutsRef.current,
-                impactX: oppCenterX,
-                impactY: oppCenterY,
-                opts: blast.stunDuration ? { stunDuration: blast.stunDuration } : undefined,
-              });
-              checkKO(opp, fighter.side);
-            }
-          }
-
-          if (fighter.pendingRocketVolley) {
-            const rv = fighter.pendingRocketVolley;
-            fighter.pendingRocketVolley = null;
-            const targetX = opp.hp > 0 ? opp.x + opp.vx * 0.05 : (minX + maxX) * 0.5;
-            const targetY = opp.hp > 0
-              ? (opp.joints.hip.y + opp.joints.head.y) * 0.5
-              : paper.floorY - 40 * scale;
-            const dx = targetX - rv.originX;
-            const dy = targetY - rv.originY;
-            const dist = Math.max(1, Math.hypot(dx, dy));
-            const speedPx = rv.speed * scale;
-            const vx = (dx / dist) * speedPx;
-            const vy = (dy / dist) * speedPx;
-            directMissilesRef.current.push({
-              x: rv.originX,
-              y: rv.originY,
-              vx,
-              vy,
-              angle: Math.atan2(vy, vx),
-              isBig: rv.isBig,
-              damage: rv.damage,
-              blastRadius: rv.blastRadiusR * rv.weaponReach,
-              knockback: rv.knockback,
-              ownerSide: rv.ownerSide,
-              life: 2.2,
-              trail: [],
-              trailEmitTimer: 0,
-              seed: Math.random() * 500,
-            });
-            if (rv.isBig) {
-              shakeRef.current = Math.max(shakeRef.current, 4.2);
-              particlesRef.current.push({
-                x: rv.originX,
-                y: rv.originY,
-                vx: 0,
-                vy: 0,
-                life: 0.28,
-                maxLife: 0.28,
-                size: 14 * scale,
-                color: '#DC2626',
-                kind: 'ring',
-                angle: 0,
-                spin: 0,
-                seed: Math.random() * 120,
-              });
-              calloutsRef.current.push({
-                x: fighter.joints.head.x,
-                y: fighter.joints.head.y - 34 * fighter.scale,
-                vy: -26,
-                text: 'TÊN LỬA BỰ!',
-                color: '#DC2626',
-                life: 0.65,
-                maxLife: 0.65,
-                scale: 1.08,
-                tilt: fighter.side === 'left' ? -0.1 : 0.1,
-              });
-            }
-          }
-
-          if (fighter.pendingShieldThrow) {
-            const p = fighter.pendingShieldThrow;
-            fighter.pendingShieldThrow = null;
-            thrownShieldsRef.current.push(
-              createThrownShield(
-                p.x,
-                p.y,
-                p.vx,
-                p.vy,
-                fighter.scale,
-                p.ownerSide,
-                p.damage,
-                fighter.characterId === 'lonsat'
-                  ? 'lonsat'
-                  : fighter.characterId === 'hebongbay'
-                    ? 'hebongbay'
-                    : 'standard',
-              ),
-            );
-          }
-
-          if (fighter.pendingBopCallout) {
-            fighter.pendingBopCallout = false;
-            calloutsRef.current.push({
-              x: fighter.x,
-              y: Math.max(76, paper.floorY - 210 * scale),
-              vy: 35,
-              text: 'BỐP!',
-              color: '#B91C1C',
-              life: 0.55,
-              maxLife: 0.55,
-              scale: 1.45,
-              tilt: -0.14,
-            });
-          }
-
-          if (fighter.pendingPaperTear) {
-            const tearInfo = fighter.pendingPaperTear;
-            fighter.pendingPaperTear = null;
-            paperTearsRef.current.push({
-              x: tearInfo.x,
-              y: tearInfo.y,
-              width: tearInfo.width,
-              life: 6.5,
-              maxLife: 6.5,
-              seed: Math.random() * 1000,
-            });
-            shakeRef.current = Math.max(shakeRef.current, tearInfo.heavy ? 14 : 11);
-
-            // Paper tear shock tosses nearby grounded opponent lightly!
-            if (
-              !fighter.hasHitThisAction &&
-              opp.hp > 0 &&
-              !opp.isDragged &&
-              opp.action !== 'KO' &&
-              opp.action !== 'DODGE_BACK' &&
-              Math.abs(opp.x - tearInfo.x) < 118 * fighter.scale &&
-              opp.y >= paper.floorY - 30 * scale
-            ) {
-              const kbDir: 1 | -1 = opp.x >= tearInfo.x ? 1 : -1;
-              resolveHit({
-                attacker: fighter,
-                defender: opp,
-                rawDamage: Math.round(9 * fighter.characterDef.damageDealt),
-                kbX: 165 * fighter.scale * fighter.characterDef.knockbackDealt,
-                kbY: -195 * fighter.scale,
-                heavy: false,
-                attackerDir: kbDir,
-                attackType: 'HAMMER_TEAR',
-                isAoe: true,
-                particles: particlesRef.current,
-                callouts: calloutsRef.current,
-                impactX: opp.x,
-                impactY: paper.floorY - 20 * opp.scale,
-                weaponSource: 'hammer',
-              });
-              calloutsRef.current.push({
-                x: opp.joints.head.x,
-                y: opp.joints.head.y - 34 * opp.scale,
-                vy: -42,
-                text: 'XÉ GIẤY!',
-                color: '#334155',
-                life: 0.62,
-                maxLife: 0.62,
-                scale: 0.95,
-                tilt: 0.12,
-              });
-              checkKO(opp, fighter.side);
-            }
-          }
-
-          if (fighter.pendingPinnedSpear) {
-            const ps = fighter.pendingPinnedSpear;
-            fighter.pendingPinnedSpear = null;
-            const pinDur = ps.duration ?? 0.95;
-            pinnedSpearsRef.current.push({
-              x: ps.x,
-              y: ps.y,
-              facing: ps.facing,
-              scale: ps.scale,
-              life: pinDur,
-              maxLife: pinDur,
-              seed: Math.random() * 500,
-              style: ps.style,
-            });
-          }
-
-          if (fighter.pendingWallBounce) {
-            const wb = fighter.pendingWallBounce;
-            fighter.pendingWallBounce = null;
-            if (fighter.hp > 0) {
-              const ev = resolveHit({
-                attacker: null,
-                defender: fighter,
-                rawDamage: 10,
-                kbX: 0,
-                kbY: 0,
-                heavy: false,
-                attackerDir: wb.x <= fighter.x ? 1 : -1,
-                attackType: 'WALL_BOUNCE',
-                isAmbient: true,
-                directEnvHit: true,
-                particles: particlesRef.current,
-                callouts: calloutsRef.current,
-                impactX: wb.x,
-                impactY: wb.y,
-              });
-              sfx.playHit(true);
-              shakeRef.current = Math.max(shakeRef.current, 7);
-              for (let i = 0; i < 6; i++) {
-                const ang = (Math.PI * 2 * i) / 6;
+            if (fighter.pendingSteamPush) {
+              const sp = fighter.pendingSteamPush;
+              fighter.pendingSteamPush = null;
+              for (let si = 0; si < 4; si++) {
                 particlesRef.current.push({
-                  x: wb.x,
-                  y: wb.y,
-                  vx: Math.cos(ang) * 140,
-                  vy: Math.sin(ang) * 140 - 40,
-                  life: 0.45,
-                  maxLife: 0.45,
-                  size: 7.5 * scale,
-                  color: i % 2 === 0 ? '#D97706' : '#DC2626',
-                  kind: 'star',
-                  angle: ang,
-                  spin: 8,
+                  x: sp.x + sp.dir * (6 + si * 5) * fighter.scale,
+                  y: sp.y + (si - 1.5) * 4 * fighter.scale,
+                  vx: sp.dir * (115 + si * 28),
+                  vy: -24 + (si - 1.5) * 18,
+                  life: 0.36,
+                  maxLife: 0.36,
+                  size: (6.5 + si * 1.1) * fighter.scale,
+                  color: '#64748B',
+                  kind: 'steam',
+                  angle: 0,
+                  spin: 1,
                   seed: Math.random() * 100,
                 });
               }
-              calloutsRef.current.push({
-                x: wb.x,
-                y: wb.y - 26 * scale,
-                vy: -38,
-                text: `ĐỤNG LỀ! -${ev.actualDamage}`,
-                color: '#DC2626',
-                life: 0.72,
-                maxLife: 0.72,
-                scale: 1.05,
-                tilt: (Math.random() - 0.5) * 0.25,
+              for (const enemy of oppUnits) {
+                const oppDx = enemy.x - fighter.x;
+                if (
+                  enemy.hp > 0 &&
+                  !enemy.isDragged &&
+                  enemy.action !== 'KO' &&
+                  oppDx * sp.dir >= -12 * fighter.scale &&
+                  Math.abs(oppDx) <= 78 * fighter.scale &&
+                  Math.abs(enemy.y - fighter.y) <= 70 * fighter.scale
+                ) {
+                  enemy.vx += sp.dir * 135 * enemy.scale * enemy.characterDef.knockbackTaken;
+                }
+              }
+            }
+
+            if (fighter.pendingAreaBlast) {
+              const blast = fighter.pendingAreaBlast;
+              fighter.pendingAreaBlast = null;
+              areaBlastsRef.current.push({
+                x: blast.x,
+                y: blast.y,
+                radius: 14 * fighter.scale,
+                maxRadius: blast.radius,
+                life: 0.38,
+                maxLife: 0.38,
+                color: blast.color,
+                seed: Math.random() * 500,
               });
-              checkKO(fighter, oppSide);
-            }
-          }
+              shakeRef.current = Math.max(shakeRef.current, 11);
+              for (let bi = 0; bi < 14; bi++) {
+                const ang = (Math.PI * 2 * bi) / 14 + (Math.random() - 0.5) * 0.25;
+                const spd = 155 + Math.random() * 145;
+                particlesRef.current.push({
+                  x: blast.x + Math.cos(ang) * 14 * fighter.scale,
+                  y: blast.y + Math.sin(ang) * 14 * fighter.scale,
+                  vx: Math.cos(ang) * spd,
+                  vy: Math.sin(ang) * spd - 20,
+                  life: 0.44,
+                  maxLife: 0.44,
+                  size: (bi % 2 === 0 ? 7.5 : 10) * fighter.scale,
+                  color: bi % 3 === 0 ? '#64748B' : blast.color,
+                  kind: bi % 2 === 0 ? 'steam' : 'spark',
+                  angle: ang,
+                  spin: 4,
+                  seed: Math.random() * 200,
+                });
+              }
+              calloutsRef.current.push({
+                x: blast.x,
+                y: blast.y - 44 * fighter.scale,
+                vy: -42,
+                text: blast.label,
+                color: blast.color,
+                life: 0.68,
+                maxLife: 0.68,
+                scale: 1.32,
+                tilt: (Math.random() - 0.5) * 0.2,
+              });
 
-          // Heavy hammer slow recovery punish window
-          if (fightingActive && opp.hp > 0 && opp.action === 'STANCE') {
-            const atkSpec = fighter.getAttackSpecs();
-            if (atkSpec?.longRecovery && fighter.actionTime > atkSpec.activeEnd && !fighter.hasHitThisAction) {
-              opp.aiCooldown = Math.min(opp.aiCooldown, 0.04);
-            }
-          }
+              const survivedDrawn: DrawnWeapon[] = [];
+              for (const dw of drawnWeaponsRef.current) {
+                if (Math.hypot(dw.x - blast.x, dw.y - blast.y) <= blast.radius + dw.radius) {
+                  for (let si = 0; si < 5; si++) {
+                    const ang = (Math.PI * 2 * si) / 5 + Math.random() * 0.5;
+                    particlesRef.current.push({
+                      x: dw.x,
+                      y: dw.y,
+                      vx: Math.cos(ang) * 135,
+                      vy: Math.sin(ang) * 135 - 30,
+                      life: 0.3,
+                      maxLife: 0.3,
+                      size: 9 * scale,
+                      color: '#475569',
+                      kind: 'line',
+                      angle: ang,
+                      spin: 6,
+                      seed: Math.random() * 150,
+                    });
+                  }
+                } else {
+                  survivedDrawn.push(dw);
+                }
+              }
+              drawnWeaponsRef.current = survivedDrawn;
 
-          // Bat / Launcher trait: launched airborne stickman hitting drawn scribbles takes bonus collision damage!
-          if (
-            fightingActive &&
-            !fighter.isDragged &&
-            !fighter.isAirborne() &&
-            fighter.hp > 0 &&
-            fighter.action !== 'KO' &&
-            fighter.terrainHitCooldown <= 0 &&
-            fighter.y < paper.floorY - 12 * scale &&
-            Math.hypot(fighter.vx, fighter.vy) > 165 * scale
-          ) {
-            const fcx = (fighter.joints.hip.x + fighter.joints.head.x) * 0.5;
-            const fcy = (fighter.joints.hip.y + fighter.joints.head.y) * 0.5;
-            for (const dw of drawnWeaponsRef.current) {
-              if (Math.hypot(fcx - dw.x, fcy - dw.y) < dw.radius + 32 * fighter.scale) {
-                fighter.terrainHitCooldown = 0.5;
+              pinnedSpearsRef.current = pinnedSpearsRef.current.filter(
+                (ps) => Math.hypot(ps.x - blast.x, ps.y - blast.y) > blast.radius,
+              );
+              for (const enemy of oppUnits) {
+                if (enemy.action === 'PINNED' && Math.hypot(enemy.x - blast.x, enemy.y - blast.y) <= blast.radius + 24 * enemy.hitboxScale) {
+                  enemy.startAction('STANCE', 0);
+                }
+
+                const oppCenterX = enemy.x;
+                const oppCenterY = (enemy.joints.hip.y + enemy.joints.head.y) * 0.5;
+                if (
+                  enemy.hp > 0 &&
+                  !enemy.isDragged &&
+                  enemy.action !== 'KO' &&
+                  Math.hypot(oppCenterX - blast.x, oppCenterY - blast.y) <= blast.radius + 20 * enemy.hitboxScale
+                ) {
+                  enemy.homeRunTimer = 0;
+                  enemy.bodySpinRate = 0;
+                  enemy.isRecoverySliding = false;
+                  const blastDir: 1 | -1 = enemy.x >= blast.x ? 1 : -1;
+                  let kbX = 340 * blast.knockbackMult * enemy.scale;
+                  let kbY = -220 * blast.knockbackMult * enemy.scale;
+                  if (blast.knockbackDistanceR && blast.knockbackDistanceR > 0) {
+                    const desiredDist = blast.knockbackDistanceR * (blast.weaponReach ?? fighter.getWeaponReach());
+                    kbY = -340 * enemy.scale;
+                    kbX = (desiredDist / 0.62) / Math.max(0.55, enemy.characterDef.knockbackTaken);
+                  }
+                  resolveHit({
+                    attacker: fighter,
+                    defender: enemy,
+                    rawDamage: blast.damage,
+                    kbX,
+                    kbY,
+                    heavy: true,
+                    attackerDir: blastDir,
+                    attackType: blast.attackType ?? 'BOILER_VENT',
+                    isAoe: true,
+                    dodgeable: blast.dodgeable,
+                    breaksCombo: blast.breaksCombo,
+                    exceptArmored: blast.exceptArmored,
+                    particles: particlesRef.current,
+                    callouts: calloutsRef.current,
+                    impactX: oppCenterX,
+                    impactY: oppCenterY,
+                    opts: blast.stunDuration ? { stunDuration: blast.stunDuration } : undefined,
+                  });
+                  checkKO(enemy, fighter.side);
+                }
+              }
+            }
+
+            if (fighter.pendingRocketVolley) {
+              const rv = fighter.pendingRocketVolley;
+              fighter.pendingRocketVolley = null;
+              const targetX = opp.hp > 0 ? opp.x + opp.vx * 0.05 : (minX + maxX) * 0.5;
+              const targetY = opp.hp > 0
+                ? (opp.joints.hip.y + opp.joints.head.y) * 0.5
+                : paper.floorY - 40 * scale;
+              const dx = targetX - rv.originX;
+              const dy = targetY - rv.originY;
+              const dist = Math.max(1, Math.hypot(dx, dy));
+              const speedPx = rv.speed * scale;
+              const vx = (dx / dist) * speedPx;
+              const vy = (dy / dist) * speedPx;
+              directMissilesRef.current.push({
+                x: rv.originX,
+                y: rv.originY,
+                vx,
+                vy,
+                angle: Math.atan2(vy, vx),
+                isBig: rv.isBig,
+                damage: rv.damage,
+                blastRadius: rv.blastRadiusR * rv.weaponReach,
+                knockback: rv.knockback,
+                ownerSide: rv.ownerSide,
+                life: 2.2,
+                trail: [],
+                trailEmitTimer: 0,
+                seed: Math.random() * 500,
+              });
+              if (rv.isBig) {
+                shakeRef.current = Math.max(shakeRef.current, 4.2);
+                particlesRef.current.push({
+                  x: rv.originX,
+                  y: rv.originY,
+                  vx: 0,
+                  vy: 0,
+                  life: 0.28,
+                  maxLife: 0.28,
+                  size: 14 * scale,
+                  color: '#DC2626',
+                  kind: 'ring',
+                  angle: 0,
+                  spin: 0,
+                  seed: Math.random() * 120,
+                });
+                calloutsRef.current.push({
+                  x: fighter.joints.head.x,
+                  y: fighter.joints.head.y - 34 * fighter.scale,
+                  vy: -26,
+                  text: 'TÊN LỬA BỰ!',
+                  color: '#DC2626',
+                  life: 0.65,
+                  maxLife: 0.65,
+                  scale: 1.08,
+                  tilt: fighter.side === 'left' ? -0.1 : 0.1,
+                });
+              }
+            }
+
+            if (fighter.pendingShieldThrow) {
+              const p = fighter.pendingShieldThrow;
+              fighter.pendingShieldThrow = null;
+              thrownShieldsRef.current.push(
+                createThrownShield(
+                  p.x,
+                  p.y,
+                  p.vx,
+                  p.vy,
+                  fighter.scale,
+                  p.ownerSide,
+                  p.damage,
+                  fighter.characterId === 'lonsat'
+                    ? 'lonsat'
+                    : fighter.characterId === 'hebongbay'
+                      ? 'hebongbay'
+                      : 'standard',
+                ),
+              );
+            }
+
+            if (fighter.pendingLeapOverCallout) {
+              fighter.pendingLeapOverCallout = false;
+              sfx.playNinjaLeap();
+              calloutsRef.current.push({
+                x: fighter.joints.head.x,
+                y: fighter.joints.head.y - 26 * fighter.scale,
+                vy: -42,
+                text: 'VÈO!',
+                color: '#7C3AED',
+                life: 0.48,
+                maxLife: 0.48,
+                scale: 0.94,
+                tilt: (Math.random() - 0.5) * 0.2,
+              });
+            }
+
+            if (fighter.pendingShurikenThrow) {
+              const st = fighter.pendingShurikenThrow;
+              fighter.pendingShurikenThrow = null;
+              thrownShurikensRef.current.push(
+                createThrownShuriken(
+                  st.x,
+                  st.y,
+                  st.vx,
+                  st.vy,
+                  fighter.scale,
+                  st.ownerSide,
+                  st.damage,
+                ),
+              );
+              sfx.playShurikenThrow();
+            }
+
+            if (fighter.pendingBopCallout) {
+              fighter.pendingBopCallout = false;
+              calloutsRef.current.push({
+                x: fighter.x,
+                y: Math.max(76, paper.floorY - 210 * scale),
+                vy: 35,
+                text: 'BỐP!',
+                color: '#B91C1C',
+                life: 0.55,
+                maxLife: 0.55,
+                scale: 1.45,
+                tilt: -0.14,
+              });
+            }
+
+            if (fighter.pendingPaperTear) {
+              const tearInfo = fighter.pendingPaperTear;
+              fighter.pendingPaperTear = null;
+              paperTearsRef.current.push({
+                x: tearInfo.x,
+                y: tearInfo.y,
+                width: tearInfo.width,
+                life: 6.5,
+                maxLife: 6.5,
+                seed: Math.random() * 1000,
+              });
+              shakeRef.current = Math.max(shakeRef.current, tearInfo.heavy ? 14 : 11);
+
+              for (const enemy of oppUnits) {
+                if (
+                  !fighter.hitTargetsThisAction.has(enemy.instanceId) &&
+                  enemy.hp > 0 &&
+                  !enemy.isDragged &&
+                  enemy.action !== 'KO' &&
+                  enemy.action !== 'DODGE_BACK' &&
+                  Math.abs(enemy.x - tearInfo.x) < 118 * fighter.scale &&
+                  enemy.y >= paper.floorY - 30 * scale
+                ) {
+                  fighter.hitTargetsThisAction.add(enemy.instanceId);
+                  const kbDir: 1 | -1 = enemy.x >= tearInfo.x ? 1 : -1;
+                  resolveHit({
+                    attacker: fighter,
+                    defender: enemy,
+                    rawDamage: Math.round(9 * fighter.characterDef.damageDealt),
+                    kbX: 165 * fighter.scale * fighter.characterDef.knockbackDealt,
+                    kbY: -195 * fighter.scale,
+                    heavy: false,
+                    attackerDir: kbDir,
+                    attackType: 'HAMMER_TEAR',
+                    isAoe: true,
+                    particles: particlesRef.current,
+                    callouts: calloutsRef.current,
+                    impactX: enemy.x,
+                    impactY: paper.floorY - 20 * enemy.scale,
+                    weaponSource: 'hammer',
+                  });
+                  calloutsRef.current.push({
+                    x: enemy.joints.head.x,
+                    y: enemy.joints.head.y - 34 * enemy.scale,
+                    vy: -42,
+                    text: 'XÉ GIẤY!',
+                    color: '#334155',
+                    life: 0.62,
+                    maxLife: 0.62,
+                    scale: 0.95,
+                    tilt: 0.12,
+                  });
+                  checkKO(enemy, fighter.side);
+                }
+              }
+            }
+
+            if (fighter.pendingPinnedSpear) {
+              const ps = fighter.pendingPinnedSpear;
+              fighter.pendingPinnedSpear = null;
+              const pinDur = ps.duration ?? 0.95;
+              pinnedSpearsRef.current.push({
+                x: ps.x,
+                y: ps.y,
+                facing: ps.facing,
+                scale: ps.scale,
+                life: pinDur,
+                maxLife: pinDur,
+                seed: Math.random() * 500,
+                style: ps.style,
+              });
+            }
+
+            if (fighter.pendingWallBounce) {
+              const wb = fighter.pendingWallBounce;
+              fighter.pendingWallBounce = null;
+              if (fighter.hp > 0) {
                 const ev = resolveHit({
                   attacker: null,
                   defender: fighter,
@@ -1905,45 +2059,123 @@ export const PaperArena: React.FC = () => {
                   kbX: 0,
                   kbY: 0,
                   heavy: false,
-                  attackerDir: fighter.x >= dw.x ? 1 : -1,
-                  attackType: 'DRAWN_WEAPON_BOUNCE',
-                  isDrawnWeapon: true,
+                  attackerDir: wb.x <= fighter.x ? 1 : -1,
+                  attackType: 'WALL_BOUNCE',
+                  isAmbient: true,
                   directEnvHit: true,
                   particles: particlesRef.current,
                   callouts: calloutsRef.current,
-                  impactX: fcx,
-                  impactY: fcy,
+                  impactX: wb.x,
+                  impactY: wb.y,
                 });
-                fighter.vy = -190 * fighter.scale;
-                fighter.vx = -fighter.vx * 0.42;
-                dw.state = 'FALLING';
-                dw.vy = -175 * scale;
-                dw.vx = fighter.vx * 0.4;
-                dw.omega = 7.5;
-                sfx.playDrop();
-                shakeRef.current = Math.max(shakeRef.current, 4.5);
+                sfx.playHit(true);
+                shakeRef.current = Math.max(shakeRef.current, 7);
+                for (let i = 0; i < 6; i++) {
+                  const ang = (Math.PI * 2 * i) / 6;
+                  particlesRef.current.push({
+                    x: wb.x,
+                    y: wb.y,
+                    vx: Math.cos(ang) * 140,
+                    vy: Math.sin(ang) * 140 - 40,
+                    life: 0.45,
+                    maxLife: 0.45,
+                    size: 7.5 * scale,
+                    color: i % 2 === 0 ? '#D97706' : '#DC2626',
+                    kind: 'star',
+                    angle: ang,
+                    spin: 8,
+                    seed: Math.random() * 100,
+                  });
+                }
                 calloutsRef.current.push({
-                  x: fcx,
-                  y: fcy - 24 * scale,
-                  vy: -40,
-                  text: `ĐẬP NÉT! -${ev.actualDamage}`,
-                  color: '#92400E',
-                  life: 0.65,
-                  maxLife: 0.65,
-                  scale: 0.96,
-                  tilt: -0.1,
+                  x: wb.x,
+                  y: wb.y - 26 * scale,
+                  vy: -38,
+                  text: `ĐỤNG LỀ! -${ev.actualDamage}`,
+                  color: '#DC2626',
+                  life: 0.72,
+                  maxLife: 0.72,
+                  scale: 1.05,
+                  tilt: (Math.random() - 0.5) * 0.25,
                 });
                 checkKO(fighter, oppSide);
-                break;
+              }
+            }
+
+            if (fightingActive && opp.hp > 0 && opp.action === 'STANCE') {
+              const atkSpec = fighter.getAttackSpecs();
+              if (atkSpec?.longRecovery && fighter.actionTime > atkSpec.activeEnd && !fighter.hasHitThisAction) {
+                opp.aiCooldown = Math.min(opp.aiCooldown, 0.04);
+              }
+            }
+
+            if (
+              fightingActive &&
+              !fighter.isDragged &&
+              !fighter.isAirborne() &&
+              fighter.hp > 0 &&
+              fighter.action !== 'KO' &&
+              fighter.terrainHitCooldown <= 0 &&
+              fighter.y < paper.floorY - 12 * scale &&
+              Math.hypot(fighter.vx, fighter.vy) > 165 * scale
+            ) {
+              const fcx = (fighter.joints.hip.x + fighter.joints.head.x) * 0.5;
+              const fcy = (fighter.joints.hip.y + fighter.joints.head.y) * 0.5;
+              for (const dw of drawnWeaponsRef.current) {
+                if (Math.hypot(fcx - dw.x, fcy - dw.y) < dw.radius + 32 * fighter.scale) {
+                  fighter.terrainHitCooldown = 0.5;
+                  const ev = resolveHit({
+                    attacker: null,
+                    defender: fighter,
+                    rawDamage: 10,
+                    kbX: 0,
+                    kbY: 0,
+                    heavy: false,
+                    attackerDir: fighter.x >= dw.x ? 1 : -1,
+                    attackType: 'DRAWN_WEAPON_BOUNCE',
+                    isDrawnWeapon: true,
+                    directEnvHit: true,
+                    particles: particlesRef.current,
+                    callouts: calloutsRef.current,
+                    impactX: fcx,
+                    impactY: fcy,
+                  });
+                  fighter.vy = -190 * fighter.scale;
+                  fighter.vx = -fighter.vx * 0.42;
+                  dw.state = 'FALLING';
+                  dw.vy = -175 * scale;
+                  dw.vx = fighter.vx * 0.4;
+                  dw.omega = 7.5;
+                  sfx.playDrop();
+                  shakeRef.current = Math.max(shakeRef.current, 4.5);
+                  calloutsRef.current.push({
+                    x: fcx,
+                    y: fcy - 24 * scale,
+                    vy: -40,
+                    text: `ĐẬP NÉT! -${ev.actualDamage}`,
+                    color: '#92400E',
+                    life: 0.65,
+                    maxLife: 0.65,
+                    scale: 0.96,
+                    tilt: -0.1,
+                  });
+                  checkKO(fighter, oppSide);
+                  break;
+                }
               }
             }
           }
         }
-        }
 
         if (fightingActive && left && right) {
-          checkAttackHit(left, right, minX, maxX);
-          checkAttackHit(right, left, minX, maxX);
+          const leftEnemies = getTeamUnits('right');
+          const rightEnemies = getTeamUnits('left');
+          for (const u of getTeamUnits('left')) {
+            checkAttackHit(u, leftEnemies, minX, maxX);
+          }
+          for (const u of getTeamUnits('right')) {
+            checkAttackHit(u, rightEnemies, minX, maxX);
+          }
         }
 
         // Update thrown shields (attack flight, boomerang return, ricochet bounce, first-touch claim)
@@ -1954,7 +2186,8 @@ export const PaperArena: React.FC = () => {
 
           let claimed = false;
           const owner = ts.ownerSide === 'left' ? left : right;
-          const target = ts.ownerSide === 'left' ? right : left;
+          const enemySide: FighterSide = ts.ownerSide === 'left' ? 'right' : 'left';
+          const enemyTargets = getAliveTeamUnits(enemySide);
 
           if (ts.mode === 'ATTACK') {
             ts.vy += 220 * scale * rawDt;
@@ -1962,8 +2195,9 @@ export const PaperArena: React.FC = () => {
             ts.y += ts.vy * rawDt;
             ts.angle += ts.omega * rawDt;
 
-            // Check hit on opponent
-            if (!target.isDragged && target.hp > 0 && target.action !== 'KO') {
+            // Check hit on opponent team units
+            for (const target of enemyTargets) {
+              if (target.isDragged || target.hp <= 0 || target.action === 'KO') continue;
               const bodyX = (target.joints.shoulder.x + target.joints.hip.x) * 0.5;
               const bodyY = (target.joints.head.y + target.joints.hip.y) * 0.5;
               const dBody = Math.hypot(ts.x - bodyX, ts.y - bodyY);
@@ -2031,7 +2265,6 @@ export const PaperArena: React.FC = () => {
                   hitstopRef.current = 0.032;
                   checkKO(target, ts.ownerSide);
 
-                  // Probability to bounce back to thrower's hand OR ricochet off elsewhere!
                   if (Math.random() < 0.48 && owner.hp > 0 && !owner.hasShield) {
                     ts.mode = 'BOOMERANG';
                     ts.pickupDelay = 0.16;
@@ -2057,6 +2290,7 @@ export const PaperArena: React.FC = () => {
                     ts.vy = -(255 + Math.random() * 140) * scale;
                     ts.omega = randDir * 14;
                   }
+                  break;
                 }
               }
             }
@@ -2158,11 +2392,11 @@ export const PaperArena: React.FC = () => {
             }
           }
 
-          // Anyone touching a loose/resting shield first claims it!
+          // Anyone (except neverEquipWeapon companions like pig) touching a loose/resting shield first claims it!
           if (!claimed && (ts.mode === 'LOOSE_BOUNCE' || ts.mode === 'RESTING') && ts.pickupDelay <= 0) {
-            const contenders = Math.random() < 0.5 ? [left, right] : [right, left];
+            const contenders = Math.random() < 0.5 ? [...getTeamUnits('left'), ...getTeamUnits('right')] : [...getTeamUnits('right'), ...getTeamUnits('left')];
             for (const f of contenders) {
-              if (f.hasShield || f.hp <= 0 || f.action === 'KO' || f.isDragged) continue;
+              if (f.characterDef.trait.neverEquipWeapon || f.hasShield || f.hp <= 0 || f.action === 'KO' || f.isDragged) continue;
               const hitX = Math.abs(ts.x - f.x) < 34 * f.scale;
               const hitY = ts.y >= f.joints.head.y - 12 * f.scale && ts.y <= paper.floorY + 12;
               if (hitX && hitY) {
@@ -2193,6 +2427,78 @@ export const PaperArena: React.FC = () => {
         }
         thrownShieldsRef.current = nextShields;
 
+        // Update flying shurikens (single-hit, blockable, vanish on hit or leaving paper bounds)
+        const nextShurikens: ThrownShuriken[] = [];
+        for (const sh of thrownShurikensRef.current) {
+          sh.x += sh.vx * rawDt;
+          sh.y += sh.vy * rawDt;
+          sh.angle += sh.omega * rawDt;
+          sh.life -= rawDt;
+
+          if (
+            sh.life <= 0 ||
+            sh.x < minX ||
+            sh.x > maxX ||
+            sh.y >= paper.floorY - 4 * scale
+          ) {
+            continue;
+          }
+
+          if (!sh.hasHit && left && right) {
+            const owner = sh.ownerSide === 'left' ? left : right;
+            const enemySide: FighterSide = sh.ownerSide === 'left' ? 'right' : 'left';
+            for (const target of getAliveTeamUnits(enemySide)) {
+              if (target.isDragged || target.hp <= 0 || target.action === 'KO') continue;
+              const bodyX = (target.joints.shoulder.x + target.joints.hip.x) * 0.5;
+              const bodyY = (target.joints.head.y + target.joints.hip.y) * 0.5;
+              const dBody = Math.hypot(sh.x - bodyX, sh.y - bodyY);
+              const dHead = Math.hypot(sh.x - target.joints.head.x, sh.y - target.joints.head.y);
+
+              if (Math.min(dBody, dHead) < 30 * target.hitboxScale) {
+                if (
+                  target.action !== 'DODGE_BACK' &&
+                  target.action !== 'ROLL_DODGE' &&
+                  target.rollInvulnTimer <= 0
+                ) {
+                  const ev = resolveHit({
+                    attacker: owner,
+                    defender: target,
+                    rawDamage: sh.damage,
+                    kbX: 0,
+                    kbY: 0,
+                    heavy: false,
+                    attackerDir: sh.vx >= 0 ? 1 : -1,
+                    attackType: 'SHURIKEN',
+                    particles: particlesRef.current,
+                    callouts: calloutsRef.current,
+                    impactX: sh.x,
+                    impactY: sh.y,
+                    weaponSource: null,
+                    minX,
+                    maxX,
+                    opts: { calloutOverride: 'PHẬP!' },
+                  });
+                  if (ev.hitConnected || ev.fullyBlocked) {
+                    sh.hasHit = true;
+                  }
+                  if (ev.hitConnected && !ev.fullyBlocked) {
+                    sfx.playShurikenHit();
+                    shakeRef.current = Math.max(shakeRef.current, 2.5);
+                    hitstopRef.current = Math.max(hitstopRef.current, 0.02);
+                    checkKO(target, sh.ownerSide);
+                  }
+                  if (sh.hasHit) break;
+                }
+              }
+            }
+          }
+
+          if (!sh.hasHit) {
+            nextShurikens.push(sh);
+          }
+        }
+        thrownShurikensRef.current = nextShurikens;
+
         // Update drawn falling weapons (gravity, stickman collision, settling, fade-out)
         const nextDrawn: DrawnWeapon[] = [];
         for (const dw of drawnWeaponsRef.current) {
@@ -2214,11 +2520,11 @@ export const PaperArena: React.FC = () => {
             const speed = Math.hypot(dw.vx, dw.vy);
             if (speed > 45 && left && right) {
               const fighters: Array<[StickFighter, 'left' | 'right']> = [
-                [left, 'right'],
-                [right, 'left'],
+                ...getTeamUnits('left').map((u): [StickFighter, 'left' | 'right'] => [u, 'right']),
+                ...getTeamUnits('right').map((u): [StickFighter, 'left' | 'right'] => [u, 'left']),
               ];
               for (const [target, oppSide] of fighters) {
-                if (dw.hitSides.has(target.side)) continue;
+                if (dw.hitUnitIds.has(target.instanceId)) continue;
                 if (target.hp <= 0 || target.action === 'KO' || target.isDragged) continue;
 
                 const bodyX = (target.joints.shoulder.x + target.joints.hip.x) * 0.5;
@@ -2247,7 +2553,7 @@ export const PaperArena: React.FC = () => {
                   }
 
                   if (hitPoint) {
-                    dw.hitSides.add(target.side);
+                    dw.hitUnitIds.add(target.instanceId);
 
                     if (
                       target.action === 'DODGE_BACK' ||
@@ -2384,7 +2690,7 @@ export const PaperArena: React.FC = () => {
           if (peel.lifetime <= 0) continue;
           let triggered = false;
           if (left && right) {
-            for (const f of [left, right]) {
+            for (const f of [...getTeamUnits('left'), ...getTeamUnits('right')]) {
               const isInside =
                 f.hp > 0 &&
                 f.action !== 'KO' &&
@@ -2392,9 +2698,9 @@ export const PaperArena: React.FC = () => {
                 !f.isAirborne() &&
                 f.y >= paper.floorY - 12 * scale &&
                 Math.abs(f.x - peel.x) <= peel.radius;
-              const wasInside = f.side === 'left' ? peel.insideLeft : peel.insideRight;
-              if (f.side === 'left') peel.insideLeft = isInside;
-              else peel.insideRight = isInside;
+              const wasInside = peel.insideUnitIds.has(f.instanceId);
+              if (isInside) peel.insideUnitIds.add(f.instanceId);
+              else peel.insideUnitIds.delete(f.instanceId);
 
               if (
                 !triggered &&
@@ -2461,9 +2767,9 @@ export const PaperArena: React.FC = () => {
 
           let hitDone = false;
           if (left && right) {
-            const target = pie.targetSide === 'left' ? left : right;
             const owner = pie.ownerSide === 'left' ? left : right;
-            if (target.hp > 0 && target.action !== 'KO' && !target.isDragged) {
+            for (const target of getAliveTeamUnits(pie.targetSide)) {
+              if (target.hp <= 0 || target.action === 'KO' || target.isDragged) continue;
               const headD = Math.hypot(pie.x - target.joints.head.x, pie.y - target.joints.head.y);
               const chestD = Math.hypot(pie.x - target.joints.shoulder.x, pie.y - target.joints.shoulder.y);
               if (Math.min(headD, chestD) <= 30 * target.hitboxScale) {
@@ -2545,6 +2851,7 @@ export const PaperArena: React.FC = () => {
                     tilt: -0.1,
                   });
                   checkKO(target, pie.ownerSide);
+                  break;
                 }
               }
             }
@@ -2628,7 +2935,7 @@ export const PaperArena: React.FC = () => {
           });
           if (left && right) {
             const owner = jb.ownerSide === 'left' ? left : right;
-            for (const f of [left, right]) {
+            for (const f of [...getTeamUnits('left'), ...getTeamUnits('right')]) {
               if (jb.immuneSides.includes(f.side)) continue;
               if (f.hp <= 0 || f.action === 'KO' || f.isDragged || f.isAirborne()) continue;
               const cy = (f.joints.hip.y + f.joints.head.y) * 0.5;
@@ -2691,18 +2998,21 @@ export const PaperArena: React.FC = () => {
           let impactY = dm.y;
 
           if (left && right) {
-            const target = dm.ownerSide === 'left' ? right : left;
-            if (target.hp > 0 && !target.isDragged && target.action !== 'KO') {
-              const bodyX = (target.joints.shoulder.x + target.joints.hip.x) * 0.5;
-              const bodyY = (target.joints.head.y + target.joints.hip.y) * 0.5;
-              const hitR = (dm.isBig ? 32 : 22) * target.hitboxScale;
-              if (
-                Math.hypot(dm.x - bodyX, dm.y - bodyY) <= hitR ||
-                Math.hypot(dm.x - target.joints.head.x, dm.y - target.joints.head.y) <= hitR * 0.9 ||
-                Math.hypot(dm.x - target.x, dm.y - (target.y - 14 * target.scale)) <= hitR * 0.85
-              ) {
-                detonated = true;
-                hitDirect = true;
+            const enemySide: FighterSide = dm.ownerSide === 'left' ? 'right' : 'left';
+            for (const target of getAliveTeamUnits(enemySide)) {
+              if (target.hp > 0 && !target.isDragged && target.action !== 'KO') {
+                const bodyX = (target.joints.shoulder.x + target.joints.hip.x) * 0.5;
+                const bodyY = (target.joints.head.y + target.joints.hip.y) * 0.5;
+                const hitR = (dm.isBig ? 32 : 22) * target.hitboxScale;
+                if (
+                  Math.hypot(dm.x - bodyX, dm.y - bodyY) <= hitR ||
+                  Math.hypot(dm.x - target.joints.head.x, dm.y - target.joints.head.y) <= hitR * 0.9 ||
+                  Math.hypot(dm.x - target.x, dm.y - (target.y - 14 * target.scale)) <= hitR * 0.85
+                ) {
+                  detonated = true;
+                  hitDirect = true;
+                  break;
+                }
               }
             }
           }
@@ -2762,32 +3072,34 @@ export const PaperArena: React.FC = () => {
 
             if (left && right) {
               const owner = dm.ownerSide === 'left' ? left : right;
-              const target = dm.ownerSide === 'left' ? right : left;
-              if (target.hp > 0 && !target.isDragged && target.action !== 'KO') {
-                const oppBodyX = (target.joints.shoulder.x + target.joints.hip.x) * 0.5;
-                const oppBodyY = (target.joints.head.y + target.joints.hip.y) * 0.5;
-                const inBlast =
-                  hitDirect ||
-                  Math.hypot(oppBodyX - impactX, oppBodyY - impactY) <= dm.blastRadius + 20 * target.hitboxScale;
-                if (inBlast) {
-                  const blastDir: 1 | -1 = dm.vx !== 0 ? (dm.vx >= 0 ? 1 : -1) : (target.x >= impactX ? 1 : -1);
-                  resolveHit({
-                    attacker: owner,
-                    defender: target,
-                    rawDamage: dm.damage,
-                    kbX: (dm.isBig ? 330 : 175) * dm.knockback * target.scale,
-                    kbY: (dm.isBig ? -255 : -135) * dm.knockback * target.scale,
-                    heavy: dm.isBig,
-                    attackerDir: blastDir,
-                    attackType: dm.isBig ? 'BIG_ROCKET_MISSILE' : 'ROCKET_MISSILE',
-                    isAoe: true,
-                    dodgeable: false,
-                    particles: particlesRef.current,
-                    callouts: calloutsRef.current,
-                    impactX,
-                    impactY,
-                  });
-                  checkKO(target, dm.ownerSide);
+              const enemySide: FighterSide = dm.ownerSide === 'left' ? 'right' : 'left';
+              for (const target of getAliveTeamUnits(enemySide)) {
+                if (target.hp > 0 && !target.isDragged && target.action !== 'KO') {
+                  const oppBodyX = (target.joints.shoulder.x + target.joints.hip.x) * 0.5;
+                  const oppBodyY = (target.joints.head.y + target.joints.hip.y) * 0.5;
+                  const inBlast =
+                    (hitDirect && Math.hypot(oppBodyX - impactX, oppBodyY - impactY) <= dm.blastRadius + 38 * target.hitboxScale) ||
+                    Math.hypot(oppBodyX - impactX, oppBodyY - impactY) <= dm.blastRadius + 20 * target.hitboxScale;
+                  if (inBlast) {
+                    const blastDir: 1 | -1 = dm.vx !== 0 ? (dm.vx >= 0 ? 1 : -1) : (target.x >= impactX ? 1 : -1);
+                    resolveHit({
+                      attacker: owner,
+                      defender: target,
+                      rawDamage: dm.damage,
+                      kbX: (dm.isBig ? 330 : 175) * dm.knockback * target.scale,
+                      kbY: (dm.isBig ? -255 : -135) * dm.knockback * target.scale,
+                      heavy: dm.isBig,
+                      attackerDir: blastDir,
+                      attackType: dm.isBig ? 'BIG_ROCKET_MISSILE' : 'ROCKET_MISSILE',
+                      isAoe: true,
+                      dodgeable: false,
+                      particles: particlesRef.current,
+                      callouts: calloutsRef.current,
+                      impactX,
+                      impactY,
+                    });
+                    checkKO(target, dm.ownerSide);
+                  }
                 }
               }
             }
@@ -3002,8 +3314,15 @@ export const PaperArena: React.FC = () => {
             }
           }
 
-          // 2. Scribbled HP bars in top ruled lines during FIGHTING / KO
+          // 2. Scribbled HP bars in top ruled lines during FIGHTING / KO (sums side units seamlessly)
           if ((phaseRef.current === 'FIGHTING' || phaseRef.current === 'KO') && left && right) {
+            const leftUnits = getTeamUnits('left');
+            const rightUnits = getTeamUnits('right');
+            const leftHpSum = leftUnits.reduce((acc, u) => acc + Math.max(0, u.hp), 0);
+            const leftMaxSum = Math.max(1, leftUnits.reduce((acc, u) => acc + u.maxHp, 0));
+            const rightHpSum = rightUnits.reduce((acc, u) => acc + Math.max(0, u.hp), 0);
+            const rightMaxSum = Math.max(1, rightUnits.reduce((acc, u) => acc + u.maxHp, 0));
+
             const isNarrow = paper.width < 768;
             const barY = isNarrow ? 68 : 26;
             const usableW = paper.width - paper.marginX - 32;
@@ -3016,14 +3335,14 @@ export const PaperArena: React.FC = () => {
             ctx.font = `${isNarrow ? 16 : 18}px "Patrick Hand", cursive, sans-serif`;
             ctx.fillStyle = '#1E3A8A';
             ctx.textAlign = 'left';
-            ctx.fillText(`${left.characterDef.name} (Xanh) · ${left.hp}`, leftBarX, barY - 5);
+            ctx.fillText(`${left.characterDef.name} (Xanh) · ${leftHpSum}`, leftBarX, barY - 5);
             drawSketchHealthBar(
               ctx,
               leftBarX,
               barY,
               barW,
               barH,
-              left.hp / left.maxHp,
+              leftHpSum / leftMaxSum,
               '#2563EB',
               401,
               false,
@@ -3031,14 +3350,14 @@ export const PaperArena: React.FC = () => {
 
             ctx.fillStyle = '#991B1B';
             ctx.textAlign = 'right';
-            ctx.fillText(`${right.hp} · ${right.characterDef.name} (Đỏ)`, rightBarX + barW, barY - 5);
+            ctx.fillText(`${rightHpSum} · ${right.characterDef.name} (Đỏ)`, rightBarX + barW, barY - 5);
             drawSketchHealthBar(
               ctx,
               rightBarX,
               barY,
               barW,
               barH,
-              right.hp / right.maxHp,
+              rightHpSum / rightMaxSum,
               '#DC2626',
               801,
               true,
@@ -3065,8 +3384,9 @@ export const PaperArena: React.FC = () => {
               alpha: 0.65,
             });
           } else if (selectedTrayRef.current && left && right) {
-            // Soft indicator on both fighters when tap-selected
-            for (const f of [left, right]) {
+            // Soft indicator on weapon-capable fighters when tap-selected
+            for (const f of [...getTeamUnits('left'), ...getTeamUnits('right')]) {
+              if (f.characterDef.trait.neverEquipWeapon || f.hp <= 0 || f.action === 'KO') continue;
               const cx = (f.joints.hip.x + f.joints.head.x) * 0.5;
               const cy = (f.joints.hip.y + f.joints.head.y) * 0.5;
               drawSketchCircle(ctx, cx, cy, 48 * f.hitboxScale, {
@@ -3080,9 +3400,30 @@ export const PaperArena: React.FC = () => {
             }
           }
 
-          // 4. Torn paper rips on floor, banana peels, jack-in-the-box traps, drawn falling/resting weapons & thrown shields
+          // 4. Torn paper rips on floor, snapped reins, banana peels, jack-in-the-box traps, drawn falling/resting weapons & thrown shields
           for (const tear of paperTearsRef.current) {
             drawPaperTear(ctx, tear, boilTick);
+          }
+          for (const sr of snappedReinsRef.current) {
+            const midX = (sr.x1 + sr.x2) * 0.5;
+            drawSketchPolyline(
+              ctx,
+              [
+                { x: sr.x1, y: sr.y - 2 * scale },
+                { x: (sr.x1 + midX) * 0.5, y: sr.y - 5 * scale },
+                { x: midX - 4 * scale, y: sr.y - 1 * scale },
+              ],
+              { color: '#92400E', lineWidth: 1.9 * scale, roughness: 0.7, seed: sr.seed, passes: 1, alpha: 0.86 },
+            );
+            drawSketchPolyline(
+              ctx,
+              [
+                { x: midX + 4 * scale, y: sr.y - 1.5 * scale },
+                { x: (midX + sr.x2) * 0.5, y: sr.y - 5 * scale },
+                { x: sr.x2, y: sr.y - 2 * scale },
+              ],
+              { color: '#92400E', lineWidth: 1.9 * scale, roughness: 0.7, seed: sr.seed + 5, passes: 1, alpha: 0.86 },
+            );
           }
           for (const peel of bananaPeelsRef.current) {
             const fade = Math.min(1, peel.lifetime / 0.8);
@@ -3187,6 +3528,9 @@ export const PaperArena: React.FC = () => {
           }
           for (const ts of thrownShieldsRef.current) {
             drawThrownShield(ctx, ts, boilTick);
+          }
+          for (const sh of thrownShurikensRef.current) {
+            drawThrownShuriken(ctx, sh, boilTick);
           }
           for (const pod of detachedPodsRef.current) {
             const podFade = Math.min(1, pod.life / 0.8);
@@ -3400,8 +3744,8 @@ export const PaperArena: React.FC = () => {
           }
 
           // Dashed warning circle under/around any fighter winding up VENT_WARN or TAKEOFF_WARN
-          for (const f of [left, right]) {
-            if (f && (f.action === 'VENT_WARN' || f.action === 'TAKEOFF_WARN') && f.hp > 0) {
+          for (const f of activeAllUnits) {
+            if ((f.action === 'VENT_WARN' || f.action === 'TAKEOFF_WARN') && f.hp > 0) {
               const isTakeoff = f.action === 'TAKEOFF_WARN';
               const bodyH = 105 * f.scale;
               const mult = isTakeoff
@@ -3446,13 +3790,39 @@ export const PaperArena: React.FC = () => {
             });
           }
 
-          // 7. Draw spawned fighters (dragged one on top)
-          if (left?.isDragged) {
-            right?.draw(ctx, paper.floorY, boilTick, now);
-            left.draw(ctx, paper.floorY, boilTick, now);
-          } else {
-            left?.draw(ctx, paper.floorY, boilTick, now);
-            right?.draw(ctx, paper.floorY, boilTick, now);
+          // 7. Draw spawned fighters + split companions (dragged one on top)
+          const nonDragged = activeAllUnits.filter((u) => !u.isDragged);
+          const draggedUnits = activeAllUnits.filter((u) => u.isDragged);
+          for (const u of [...nonDragged, ...draggedUnits]) {
+            u.draw(ctx, paper.floorY, boilTick, now);
+          }
+
+          // Individual mini health bars above each unit ONLY when that side has split into 2 units
+          if (phaseRef.current === 'FIGHTING' || phaseRef.current === 'KO') {
+            for (const side of ['left', 'right'] as const) {
+              const comp = side === 'left' ? leftCompanionRef.current : rightCompanionRef.current;
+              if (!comp) continue;
+              const col = side === 'left' ? '#2563EB' : '#DC2626';
+              for (const u of getTeamUnits(side)) {
+                const miniW = 46 * scale;
+                const miniH = 7 * scale;
+                const topY =
+                  u.characterId === 'lon'
+                    ? u.y - 54 * u.scale
+                    : Math.min(u.joints.head.y, u.y - 82 * u.scale) - 24 * scale;
+                drawSketchHealthBar(
+                  ctx,
+                  u.x - miniW * 0.5,
+                  topY,
+                  miniW,
+                  miniH,
+                  Math.max(0, u.hp) / Math.max(1, u.maxHp),
+                  u.characterId === 'lon' ? '#DB2777' : col,
+                  u.seedBase + 99,
+                  side === 'right',
+                );
+              }
+            }
           }
 
           // Quivering spears pinning fighters onto the paper
@@ -3739,18 +4109,21 @@ export const PaperArena: React.FC = () => {
       setSelectedTrayWeapon(null);
     }
 
-    const hitLeft = left.action !== 'ENTRANCE_JUMP' && left.containsPoint(x, y);
-    const hitRight = right.action !== 'ENTRANCE_JUMP' && right.containsPoint(x, y);
+    const allHitUnits = [
+      left,
+      leftCompanionRef.current,
+      right,
+      rightCompanionRef.current,
+    ].filter((u): u is StickFighter => u !== null && u.action !== 'ENTRANCE_JUMP' && u.containsPoint(x, y));
 
     let chosen: StickFighter | null = null;
-    if (hitLeft && hitRight) {
-      const dL = Math.hypot(x - left.x, y - (left.y - 45 * left.scale));
-      const dR = Math.hypot(x - right.x, y - (right.y - 45 * right.scale));
-      chosen = dL <= dR ? left : right;
-    } else if (hitLeft) {
-      chosen = left;
-    } else if (hitRight) {
-      chosen = right;
+    let chosenDist = Infinity;
+    for (const u of allHitUnits) {
+      const d = Math.hypot(x - u.x, y - (u.y - 45 * u.scale));
+      if (d < chosenDist) {
+        chosenDist = d;
+        chosen = u;
+      }
     }
 
     e.currentTarget.setPointerCapture(e.pointerId);
@@ -3791,9 +4164,13 @@ export const PaperArena: React.FC = () => {
       return;
     }
 
-    const left = leftFighterRef.current;
-    const right = rightFighterRef.current;
-    const over = Boolean(left?.containsPoint(x, y) || right?.containsPoint(x, y));
+    const allHoverUnits = [
+      leftFighterRef.current,
+      leftCompanionRef.current,
+      rightFighterRef.current,
+      rightCompanionRef.current,
+    ];
+    const over = allHoverUnits.some((u) => Boolean(u?.containsPoint(x, y)));
     if (over !== hoveringFighter) {
       setHoveringFighter(over);
     }

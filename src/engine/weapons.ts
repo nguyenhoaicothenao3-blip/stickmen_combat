@@ -1,4 +1,4 @@
-import { drawSketchCircle, drawSketchLine, hash1D } from './sketchDraw';
+import { drawSketchCircle, drawSketchLine, drawSketchPolyline, hash1D } from './sketchDraw';
 
 export type WeaponType = 'sword' | 'bat' | 'spear' | 'hammer' | 'shield';
 export type PrimaryWeaponType = Exclude<WeaponType, 'shield'>;
@@ -952,7 +952,7 @@ export interface DrawnWeapon {
   state: 'FALLING' | 'RESTING';
   restTimer: number;
   fadeTimer: number;
-  hitSides: Set<'left' | 'right'>;
+  hitUnitIds: Set<number>;
 }
 
 let nextDrawnId = 1;
@@ -1067,7 +1067,7 @@ export function createDrawnWeaponFromStroke(
     state: 'FALLING',
     restTimer: 4.5,
     fadeTimer: 1.25,
-    hitSides: new Set(),
+    hitUnitIds: new Set(),
   };
 }
 
@@ -1280,3 +1280,137 @@ export function drawPinnedSpear(
     ctx.restore();
   }
 }
+
+export interface ThrownShuriken {
+  id: number;
+  x: number;
+  y: number;
+  vx: number;
+  vy: number;
+  angle: number;
+  omega: number;
+  scale: number;
+  ownerSide: 'left' | 'right';
+  damage: number;
+  life: number;
+  maxLife: number;
+  hasHit: boolean;
+  hitOnce: true;
+  blockable: true;
+  seed: number;
+}
+
+let nextShurikenId = 1;
+
+export function createThrownShuriken(
+  x: number,
+  y: number,
+  vx: number,
+  vy: number,
+  scale: number,
+  ownerSide: 'left' | 'right',
+  damage = 7,
+): ThrownShuriken {
+  const id = nextShurikenId++;
+  return {
+    id,
+    x,
+    y,
+    vx,
+    vy,
+    angle: 0,
+    omega: (vx >= 0 ? 1 : -1) * 26,
+    scale,
+    ownerSide,
+    damage,
+    life: 1.6,
+    maxLife: 1.6,
+    hasHit: false,
+    hitOnce: true,
+    blockable: true,
+    seed: 910 + id * 29.7,
+  };
+}
+
+export function drawThrownShuriken(
+  ctx: CanvasRenderingContext2D,
+  sh: ThrownShuriken,
+  boilTick: number,
+) {
+  if (sh.hasHit || sh.life <= 0) return;
+  const s = sh.scale;
+  const seed = sh.seed + boilTick * 5.3;
+  const spd = Math.hypot(sh.vx, sh.vy) || 1;
+  const dirX = sh.vx / spd;
+  const dirY = sh.vy / spd;
+
+  // Pencil streak behind the flying shuriken
+  for (let i = 0; i < 2; i++) {
+    const offPerp = (i === 0 ? -1 : 1) * 3.8 * s;
+    const perpX = -dirY * offPerp;
+    const perpY = dirX * offPerp;
+    const startOff = 10 * s;
+    const endOff = (28 + i * 7) * s;
+    drawSketchLine(
+      ctx,
+      sh.x - dirX * startOff + perpX,
+      sh.y - dirY * startOff + perpY,
+      sh.x - dirX * endOff + perpX,
+      sh.y - dirY * endOff + perpY,
+      {
+        color: i === 0 ? '#7C3AED' : '#475569',
+        lineWidth: 1.5 * s,
+        roughness: 0.45,
+        seed: seed + 30 + i,
+        passes: 1,
+        alpha: 0.8,
+      },
+    );
+  }
+
+  const r = 9.5 * s;
+  ctx.save();
+  ctx.translate(sh.x, sh.y);
+  ctx.rotate(sh.angle);
+
+  // 4-point purple/dark-ink star blades
+  const pts: Array<{ x: number; y: number }> = [];
+  for (let k = 0; k < 8; k++) {
+    const a = (k * Math.PI) / 4;
+    const rad = k % 2 === 0 ? r : r * 0.34;
+    pts.push({ x: Math.cos(a) * rad, y: Math.sin(a) * rad });
+  }
+  pts.push(pts[0]);
+
+  ctx.fillStyle = '#7C3AED';
+  ctx.globalAlpha = 0.3;
+  ctx.beginPath();
+  ctx.moveTo(pts[0].x, pts[0].y);
+  for (let k = 1; k < pts.length; k++) {
+    ctx.lineTo(pts[k].x, pts[k].y);
+  }
+  ctx.closePath();
+  ctx.fill();
+  ctx.globalAlpha = 1;
+
+  drawSketchPolyline(ctx, pts, {
+    color: '#0F172A',
+    lineWidth: 1.55 * s,
+    roughness: 0.35,
+    seed: seed + 1,
+    passes: 1,
+    alpha: 0.96,
+  });
+
+  drawSketchCircle(ctx, 0, 0, 1.9 * s, {
+    color: '#7C3AED',
+    lineWidth: 1.3 * s,
+    roughness: 0.25,
+    seed: seed + 5,
+    passes: 1,
+    alpha: 0.96,
+  });
+
+  ctx.restore();
+}
+

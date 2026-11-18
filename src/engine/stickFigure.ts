@@ -3,6 +3,7 @@ import {
   BASE_FIGHTER_HP,
   CharacterDef,
   CharacterId,
+  CharacterPhaseTime,
   getCharacterDef,
 } from './characters';
 import {
@@ -64,6 +65,7 @@ export type FighterAction =
   | 'BACKSTEP'
   | 'DODGE_BACK'
   | 'ROLL_DODGE'
+  | 'LEAP_OVER'
   | 'VENT_WARN'
   | 'TAKEOFF_WARN'
   | 'TAKEOFF_FLIGHT'
@@ -112,7 +114,7 @@ export interface Particle {
   maxLife: number;
   size: number;
   color: string;
-  kind: 'spark' | 'dust' | 'star' | 'line' | 'slash' | 'ring' | 'crack' | 'steam' | 'oil' | 'screw' | 'confetti' | 'puff' | 'cream';
+  kind: 'spark' | 'dust' | 'star' | 'line' | 'slash' | 'ring' | 'crack' | 'steam' | 'oil' | 'screw' | 'confetti' | 'puff' | 'cream' | 'moonBeam' | 'fur' | 'drool' | 'pounce';
   angle: number;
   spin: number;
   seed: number;
@@ -205,6 +207,10 @@ export interface HitResolvedEvent {
   rawDamage: number;
   actualDamage: number;
   attackType: string;
+  hitCategory: 'light' | 'heavy' | 'aoe' | 'thrownShield';
+  hpAfter: number;
+  causedKnockdown: boolean;
+  knockdownReason: 'none' | 'normal' | 'pinned';
   isAoe: boolean;
   isDrawnWeapon: boolean;
   isAmbient: boolean;
@@ -246,6 +252,8 @@ export interface ResolveHitInput {
     pinDurationMul?: number;
     homeRun?: boolean;
     stunDuration?: number;
+    calloutOverride?: string;
+    attackerWolfClaw?: boolean;
   };
 }
 
@@ -277,6 +285,15 @@ export function resolveHit(input: ResolveHitInput): HitResolvedEvent {
     opts,
   } = input;
 
+  const hitCategory: HitResolvedEvent['hitCategory'] =
+    attackType === 'SHIELD_THROW'
+      ? 'thrownShield'
+      : isAoe
+        ? 'aoe'
+        : heavy
+          ? 'heavy'
+          : 'light';
+
   if (defender.hp <= 0 || defender.action === 'KO' || defender.isDragged) {
     return {
       attacker,
@@ -284,6 +301,10 @@ export function resolveHit(input: ResolveHitInput): HitResolvedEvent {
       rawDamage,
       actualDamage: 0,
       attackType,
+      hitCategory,
+      hpAfter: defender.hp,
+      causedKnockdown: false,
+      knockdownReason: 'none',
       isAoe,
       isDrawnWeapon,
       isAmbient,
@@ -327,6 +348,7 @@ export function resolveHit(input: ResolveHitInput): HitResolvedEvent {
         exceptArmored,
         breaksCombo,
         attackerPinStyle: attacker?.characterId === 'hebongbay' ? 'hebongbay' : 'standard',
+        attackerWolfClaw: Boolean(attacker?.characterId === 'nguoisoi' && attacker.isWolfForm && !weaponSource),
       },
     );
   }
@@ -410,12 +432,25 @@ export function resolveHit(input: ResolveHitInput): HitResolvedEvent {
   }
 
   const actualDamage = Math.max(0, hpBefore - defender.hp);
+  const hpAfter = defender.hp;
+  const causedKnockdown =
+    res.hitConnected && (defender.action === 'KNOCKDOWN' || defender.action === 'PINNED');
+  const knockdownReason: HitResolvedEvent['knockdownReason'] = !causedKnockdown
+    ? 'none'
+    : defender.action === 'PINNED'
+      ? 'pinned'
+      : 'normal';
+
   const event: HitResolvedEvent = {
     attacker,
     defender,
     rawDamage,
     actualDamage,
     attackType,
+    hitCategory,
+    hpAfter,
+    causedKnockdown,
+    knockdownReason,
     isAoe,
     isDrawnWeapon,
     isAmbient,
@@ -468,7 +503,10 @@ function lerpPose(current: Pose, target: Pose, t: number): Pose {
   };
 }
 
+let nextFighterInstanceId = 1;
+
 export class StickFighter {
+  public readonly instanceId: number;
   public readonly side: FighterSide;
   public readonly color: string;
   public readonly accentColor: string;
@@ -490,9 +528,21 @@ export class StickFighter {
   public actionTime = 0;
   public actionDuration = 0;
   public hasHitThisAction = false;
+  public hitTargetsThisAction = new Set<number>();
   public hasCornerPushbackThisAction = false;
   public hasPlayedWhoosh = false;
   public hasBeenPulledOut = false;
+
+  // Kỵ Sĩ Lợn & Lợn Chiến ("Đứt cương tách đôi") state
+  public hasSplitApart = false;
+  public isSplitRider = false;
+  public hasTriggeredHoldGround = false;
+  public cornerPressTimer = 0;
+  public pigHeadbuttCooldown = 0;
+  public pendingSplitApart: { kbVx: number; kbDir: 1 | -1; hpAfter: number } | null = null;
+  private pigNoseSteamTimer = 0;
+  private pigSweatTimer = 0;
+  private lastPigHoofSign = 0;
 
   public aiCooldown = 0.25;
   public hitFlash = 0;
@@ -620,6 +670,34 @@ export class StickFighter {
   private clownWalkTimer = 0;
   private finaleConfettiTimer = 0;
 
+  // Ninja ("escapeLeap" + Skirmisher AI + KO erase) state
+  public escapeLeapCooldown = 0;
+  public escapeLeapReadyAnimTimer = 0;
+  public hasTriggeredNinjaDefense = false;
+  public pendingShurikenThrow: {
+    x: number;
+    y: number;
+    vx: number;
+    vy: number;
+    ownerSide: FighterSide;
+    damage: number;
+  } | null = null;
+  public pendingLeapOverCallout = false;
+  private triggeredLeapApex = false;
+  private leapStartX = 0;
+  private leapTargetX = 0;
+  private koEraseTimer = 0;
+
+  // Người Sói ("moonForm") state
+  public moonGauge = 0;
+  public isWolfForm = false;
+  public isTransformingWolf = false;
+  public wolfStashedWeapon: PrimaryWeaponType | null = null;
+  public pendingWolfTransformEffect = false;
+  public pendingWolfRevertEffect = false;
+  public wolfPantTimer = 0;
+  private wolfDroolTimer = 0;
+
   private flightTimer = 0;
   private flightVolleyIndex = 0;
   private flightSmokeTimer = 0;
@@ -684,6 +762,7 @@ export class StickFighter {
     arenaScale = 1,
     characterId: CharacterId = 'normal',
   ) {
+    this.instanceId = nextFighterInstanceId++;
     this.side = side;
     this.characterId = characterId;
     this.characterDef = getCharacterDef(characterId);
@@ -693,7 +772,7 @@ export class StickFighter {
     this.facing = side === 'left' ? 1 : -1;
     this.arenaScale = arenaScale;
     this.scale = arenaScale * this.characterDef.scale;
-    this.hitboxScale = arenaScale * this.characterDef.hitbox;
+    this.hitboxScale = arenaScale * this.getEffectiveHitboxStat();
     this.maxHp = Math.round(BASE_FIGHTER_HP * this.characterDef.hp);
     this.hp = this.maxHp;
     this.x = startX;
@@ -708,8 +787,7 @@ export class StickFighter {
 
   public setArenaScale(arenaScale: number) {
     this.arenaScale = arenaScale;
-    this.scale = arenaScale * this.characterDef.scale;
-    this.hitboxScale = arenaScale * this.characterDef.hitbox;
+    this.refreshEffectiveScale();
   }
 
   public reset(startX: number, floorY: number, arenaScale: number, characterId?: CharacterId) {
@@ -717,9 +795,18 @@ export class StickFighter {
       this.characterId = characterId;
       this.characterDef = getCharacterDef(characterId);
     }
+    this.hasSplitApart = false;
+    this.isSplitRider = false;
+    this.hasTriggeredHoldGround = false;
+    this.cornerPressTimer = 0;
+    this.pigHeadbuttCooldown = 0;
+    this.pendingSplitApart = null;
+    this.pigNoseSteamTimer = 0;
+    this.pigSweatTimer = 0;
+    this.lastPigHoofSign = 0;
     this.arenaScale = arenaScale;
     this.scale = arenaScale * this.characterDef.scale;
-    this.hitboxScale = arenaScale * this.characterDef.hitbox;
+    this.hitboxScale = arenaScale * this.getEffectiveHitboxStat();
     this.x = startX;
     this.y = floorY;
     this.vx = 0;
@@ -733,6 +820,7 @@ export class StickFighter {
     this.actionTime = 0;
     this.actionDuration = 0;
     this.hasHitThisAction = false;
+    this.hitTargetsThisAction.clear();
     this.hasCornerPushbackThisAction = false;
     this.hasPlayedWhoosh = false;
     this.hasBeenPulledOut = false;
@@ -821,6 +909,24 @@ export class StickFighter {
     this.poppedShoeSide = null;
     this.clownWalkTimer = 0;
     this.finaleConfettiTimer = 0;
+    this.escapeLeapCooldown = 0;
+    this.escapeLeapReadyAnimTimer = 0;
+    this.hasTriggeredNinjaDefense = false;
+    this.pendingShurikenThrow = null;
+    this.pendingLeapOverCallout = false;
+    this.triggeredLeapApex = false;
+    this.leapStartX = startX;
+    this.leapTargetX = startX;
+    this.koEraseTimer = 0;
+    this.moonGauge = 0;
+    this.isWolfForm = false;
+    this.isTransformingWolf = false;
+    this.wolfStashedWeapon = null;
+    this.pendingWolfTransformEffect = false;
+    this.pendingWolfRevertEffect = false;
+    this.wolfPantTimer = 0;
+    this.wolfDroolTimer = 0;
+    this.refreshEffectiveScale();
     this.flightTimer = 0;
     this.flightVolleyIndex = 0;
     this.flightSmokeTimer = 0;
@@ -891,6 +997,7 @@ export class StickFighter {
       this.comboBeatCount = 0;
     }
     this.hasHitThisAction = false;
+    this.hitTargetsThisAction.clear();
     this.hasCornerPushbackThisAction = false;
     this.hasPlayedWhoosh = false;
     this.hasReleasedShield = false;
@@ -936,13 +1043,27 @@ export class StickFighter {
       next === 'VENT_WARN' ||
       next === 'TAKEOFF_WARN' ||
       next === 'TAKEOFF_FLIGHT' ||
-      next === 'TAKEOFF_LAND_STUCK'
+      next === 'TAKEOFF_LAND_STUCK' ||
+      next === 'LEAP_OVER'
     ) {
       this.bodySpin = 0;
       this.bodySpinRate = 0;
       this.zonerComboBeats = 0;
     }
+    if (next === 'KO') {
+      this.koEraseTimer = 0;
+    }
     this.prevTip = null;
+  }
+
+  public getTraitCooldownRemaining(): number {
+    if (this.characterDef.trait.id === 'escapeLeap') return this.escapeLeapCooldown;
+    if (this.characterDef.trait.id === 'rollDodge') return this.rollCooldown;
+    return 0;
+  }
+
+  public isTraitReady(): boolean {
+    return this.getTraitCooldownRemaining() <= 0;
   }
 
   public isAirborne(): boolean {
@@ -1137,7 +1258,153 @@ export class StickFighter {
     this.startAction('TAKEOFF_WARN', takeoffCfg.megaVent.warnTime);
   }
 
+  public getEffectiveScaleStat(): number {
+    const wolfStats =
+      this.characterId === 'nguoisoi' && this.isWolfForm
+        ? this.characterDef.trait.moonForm?.wolfStats
+        : undefined;
+    return wolfStats ? wolfStats.scale : this.characterDef.scale;
+  }
+
+  public getEffectiveHitboxStat(): number {
+    if (this.isSplitRider) return 0.8;
+    const wolfStats =
+      this.characterId === 'nguoisoi' && this.isWolfForm
+        ? this.characterDef.trait.moonForm?.wolfStats
+        : undefined;
+    return wolfStats ? wolfStats.hitbox : this.characterDef.hitbox;
+  }
+
+  public getEffectiveLineWidthStat(): number {
+    const wolfStats =
+      this.characterId === 'nguoisoi' && this.isWolfForm
+        ? this.characterDef.trait.moonForm?.wolfStats
+        : undefined;
+    return wolfStats ? wolfStats.lineWidth : this.characterDef.lineWidth;
+  }
+
+  public getEffectiveJitterFps(): number {
+    const wolfStats =
+      this.characterId === 'nguoisoi' && this.isWolfForm
+        ? this.characterDef.trait.moonForm?.wolfStats
+        : undefined;
+    return wolfStats ? wolfStats.jitterFps : this.characterDef.jitterFps;
+  }
+
+  public refreshEffectiveScale() {
+    this.scale = this.arenaScale * this.getEffectiveScaleStat();
+    this.hitboxScale = this.arenaScale * this.getEffectiveHitboxStat();
+  }
+
+  public getEffectiveMoveSpeedStat(): number {
+    if (this.isSplitRider) return 1.1;
+    const wolfStats =
+      this.characterId === 'nguoisoi' && this.isWolfForm
+        ? this.characterDef.trait.moonForm?.wolfStats
+        : undefined;
+    return wolfStats ? wolfStats.moveSpeed : this.characterDef.moveSpeed;
+  }
+
+  public getEffectiveDamageDealtStat(): number {
+    if (this.isSplitRider) return 0.95;
+    const wolfStats =
+      this.characterId === 'nguoisoi' && this.isWolfForm
+        ? this.characterDef.trait.moonForm?.wolfStats
+        : undefined;
+    return wolfStats ? wolfStats.damageDealt : this.characterDef.damageDealt;
+  }
+
+  public getEffectiveKnockbackDealtStat(): number {
+    if (this.isSplitRider) return 0.9;
+    const wolfStats =
+      this.characterId === 'nguoisoi' && this.isWolfForm
+        ? this.characterDef.trait.moonForm?.wolfStats
+        : undefined;
+    return wolfStats ? wolfStats.knockbackDealt : this.characterDef.knockbackDealt;
+  }
+
+  public getEffectiveKnockbackTakenStat(): number {
+    if (this.isSplitRider) return 1.3;
+    const wolfStats =
+      this.characterId === 'nguoisoi' && this.isWolfForm
+        ? this.characterDef.trait.moonForm?.wolfStats
+        : undefined;
+    return wolfStats ? wolfStats.knockbackTaken : this.characterDef.knockbackTaken;
+  }
+
+  public getEffectivePhaseTime(): CharacterPhaseTime {
+    if (this.isSplitRider) return { windup: 0.9, strike: 0.9, recovery: 0.9 };
+    const wolfStats =
+      this.characterId === 'nguoisoi' && this.isWolfForm
+        ? this.characterDef.trait.moonForm?.wolfStats
+        : undefined;
+    return wolfStats ? wolfStats.phaseTime : this.characterDef.phaseTime;
+  }
+
+  public getEffectiveAIStyle() {
+    return this.isSplitRider ? 'weaponUser' : this.characterDef.ai.style;
+  }
+
+  public convertToSplitRider(riderHp: number, riderMaxHp: number) {
+    this.hasSplitApart = true;
+    this.isSplitRider = true;
+    this.hp = Math.max(0, riderHp);
+    this.maxHp = Math.max(1, riderMaxHp);
+    this.hitboxScale = this.arenaScale * 0.8;
+    this.comboQueue = [];
+    this.shouldRetreatAfterCombo = false;
+    this.vx = 0;
+    this.vy = 0;
+    this.bodySpin = 0;
+    this.bodySpinRate = 0;
+    this.aiCooldown = 0.28;
+    if (this.hp <= 0) {
+      this.startAction('KO', 0);
+    } else {
+      this.startAction('STANCE', 0);
+    }
+  }
+
   public onHitResolved(ev: HitResolvedEvent) {
+    if (
+      this.characterId === 'kysilon' &&
+      !this.hasSplitApart &&
+      !this.isSplitRider &&
+      this.characterDef.trait.id === 'pigMount'
+    ) {
+      const splitRatio = this.characterDef.trait.splitBelowHp ?? 0.4;
+      if (ev.hpAfter > 0 && ev.hpAfter <= this.maxHp * splitRatio) {
+        const kdTrigger =
+          Boolean(this.characterDef.trait.splitOnKnockdown) &&
+          ev.causedKnockdown &&
+          ev.knockdownReason !== 'pinned';
+        const shieldTrigger =
+          Boolean(this.characterDef.trait.splitOnThrownShield) &&
+          ev.hitCategory === 'thrownShield' &&
+          ev.hitConnected &&
+          !ev.fullyBlocked &&
+          !ev.armored;
+        if (kdTrigger || shieldTrigger) {
+          const kbDir: 1 | -1 =
+            this.vx !== 0
+              ? this.vx > 0
+                ? 1
+                : -1
+              : ev.attacker
+                ? ev.attacker.x <= this.x
+                  ? 1
+                  : -1
+                : (-this.facing as 1 | -1);
+          this.hasSplitApart = true;
+          this.pendingSplitApart = {
+            kbVx: this.vx,
+            kbDir,
+            hpAfter: ev.hpAfter,
+          };
+        }
+      }
+    }
+
     const trait = this.characterDef.trait;
     if (trait.id !== 'boiler') return;
     if (ev.isAmbient || ev.fullyBlocked || !ev.hitConnected || ev.actualDamage <= 0) return;
@@ -1207,6 +1474,24 @@ export class StickFighter {
 
   public onAttackHitResolved(ev: HitResolvedEvent) {
     const trait = this.characterDef.trait;
+    if (trait.id === 'moonForm' && trait.moonForm) {
+      if (
+        !this.isWolfForm &&
+        !this.isTransformingWolf &&
+        this.hp > 0 &&
+        !ev.isAmbient &&
+        !ev.fullyBlocked &&
+        ev.hitConnected &&
+        ev.actualDamage > 0 &&
+        ev.hitCategory !== 'thrownShield' &&
+        ev.attackType !== 'SHIELD_THROW'
+      ) {
+        const maxG = trait.moonForm.maxGauge ?? 80;
+        const gain = Math.round(ev.actualDamage) * (trait.moonForm.gainPerDamage ?? 1);
+        this.moonGauge = Math.min(maxG, this.moonGauge + gain);
+      }
+      return;
+    }
     if (trait.id !== 'gagBag') return;
     if (ev.isAmbient || ev.fullyBlocked || !ev.hitConnected || ev.actualDamage <= 0) return;
     if (this.hp <= 0 || this.finaleState === 'outOfTricks') return;
@@ -1313,7 +1598,7 @@ export class StickFighter {
           : 1;
     const statusSpeed = this.getStatusMoveSpeedMul();
     return (
-      this.characterDef.moveSpeed *
+      this.getEffectiveMoveSpeedStat() *
       rageBoost *
       panicBoost *
       overreachSpeed *
@@ -1382,7 +1667,7 @@ export class StickFighter {
   }
 
   public getEffectiveWindupMult(): number {
-    const base = this.isEnraged ? 1.0 : this.characterDef.phaseTime.windup;
+    const base = this.isEnraged ? 1.0 : this.getEffectivePhaseTime().windup;
     return base * this.getStatusWindupMul();
   }
 
@@ -1419,8 +1704,9 @@ export class StickFighter {
       wMult *= this.characterDef.trait.deadWindupMul;
     }
 
-    let sMult = this.characterDef.phaseTime.strike;
-    let rMult = this.characterDef.phaseTime.recovery;
+    const effPhase = this.getEffectivePhaseTime();
+    let sMult = effPhase.strike;
+    let rMult = effPhase.recovery;
     // Unarmed strong affinity (Nhóc): kicks are 15% faster
     if (
       !this.weapon &&
@@ -1602,6 +1888,61 @@ export class StickFighter {
     return true;
   }
 
+  /**
+   * Deterministic Escape Leap ("Nhảy qua đầu thoát góc") for Ninja — zero RNG.
+   */
+  public tryTriggerEscapeLeap(
+    opponent: StickFighter,
+    minX: number,
+    maxX: number,
+  ): boolean {
+    const trait = this.characterDef.trait;
+    if (trait.id !== 'escapeLeap') return false;
+    if (this.hp <= 0 || this.isDragged) return false;
+    if (this.escapeLeapCooldown > 0) return false;
+    if (this.action !== 'HURT') return false;
+    if (this.homeRunTimer > 0) return false;
+
+    const minHits = trait.minConsecutiveHits ?? 2;
+    if (this.consecutiveHitsTaken < minHits) return false;
+
+    const nearEdgeDist = (trait.nearEdge ?? 60) * this.scale;
+    const distToEdge = Math.min(this.x - minX, maxX - this.x);
+    if (distToEdge >= nearEdgeDist) return false;
+
+    const dirToOpp: 1 | -1 = opponent.x >= this.x ? 1 : -1;
+    const landDist = (trait.leap?.landDistance ?? 190) * this.scale;
+    const pad = 18 * this.scale;
+    const safeMin = minX + pad;
+    const safeMax = maxX - pad;
+    const clampedLandX = clamp(opponent.x + dirToOpp * landDist, safeMin, safeMax);
+
+    if (trait.needsLandingRoom !== false) {
+      const clearOppositeSide = (clampedLandX - opponent.x) * dirToOpp;
+      if (clearOppositeSide < 38 * this.scale) {
+        return false;
+      }
+    }
+
+    if (trait.leap?.clearsComboQueue !== false) {
+      this.comboQueue = [];
+      this.shouldRetreatAfterCombo = false;
+    }
+    this.escapeLeapCooldown = trait.cooldown ?? 8.0;
+    this.leapStartX = this.x;
+    this.leapTargetX = clampedLandX;
+    this.triggeredLeapApex = false;
+    this.pendingLeapOverCallout = true;
+    this.facing = dirToOpp;
+    this.vx = 0;
+    this.vy = 0;
+    this.bodySpin = 0;
+    this.bodySpinRate = 0;
+    this.startAction('LEAP_OVER', trait.leap?.duration ?? 0.62);
+    sfx.playNinjaLeap();
+    return true;
+  }
+
   public getWeaponVector(): { dx: number; dy: number } {
     const f = this.facing;
     const foreAngle = this.pose.upperArmR + this.pose.elbowR;
@@ -1694,6 +2035,16 @@ export class StickFighter {
         const worldAngle = foreAngle + tilt;
         return { dx: Math.sin(worldAngle) * f, dy: Math.cos(worldAngle) };
       }
+      if (this.characterId === 'ninja') {
+        if (this.action === 'DASH') {
+          const angle = -0.78;
+          return { dx: Math.sin(angle) * f, dy: Math.cos(angle) };
+        }
+        if (this.action === 'STANCE' || this.action === 'IDLE_WAIT') {
+          const angle = 1.14;
+          return { dx: Math.sin(angle) * f, dy: Math.cos(angle) };
+        }
+      }
     }
 
     if (this.weapon === 'bat') {
@@ -1772,8 +2123,8 @@ export class StickFighter {
         : 1;
     const reachScale = limbScale * overreachReachMul;
     const extraReach = wDef ? wDef.extraReach * this.scale * reachScale : 0;
-    const dmgScale = this.characterDef.damageDealt;
-    const kbScale = this.characterDef.knockbackDealt;
+    const dmgScale = this.getEffectiveDamageDealtStat();
+    const kbScale = this.getEffectiveKnockbackDealtStat();
     const hammerStrongBonus =
       this.weapon === 'hammer' && this.characterDef.affinity.hammer === 'strong' ? 1.1 : 1;
     const unarmedGoodBonus =
@@ -1908,6 +2259,17 @@ export class StickFighter {
 
     switch (this.action) {
       case 'JAB':
+        if (this.characterId === 'lon') {
+          return finalize(0.08, 0.21, 0.25, 7, 165, -45, {
+            heavy: false,
+            limb: 'handR',
+            reach: 24 * this.scale,
+            useWeapon: false,
+            weaponType: null,
+            hitstop: 0.02,
+            shake: 2.5,
+          });
+        }
         return finalize(
           this.weapon === 'sword' ? 0.07 : 0.08,
           this.weapon === 'sword' ? 0.19 : 0.21,
@@ -2148,6 +2510,17 @@ export class StickFighter {
         });
       }
       case 'SWEEP_KICK': {
+        if (this.characterId === 'lon') {
+          return finalize(0.13, 0.3, 0.38, 12, 210, -225, {
+            heavy: true,
+            limb: 'footR',
+            reach: 27 * this.scale,
+            useWeapon: false,
+            weaponType: null,
+            hitstop: 0.04,
+            shake: 5.0,
+          });
+        }
         const kickShoeBonus = !armed && this.characterDef.affinity.unarmed === 'strong' ? 7 * this.scale : 0;
         return finalize(0.13, 0.3, 0.38, 11, 160, -220, {
           heavy: true,
@@ -2184,6 +2557,28 @@ export class StickFighter {
         });
       }
       case 'SLIDE': {
+        if (this.characterId === 'lon' || (this.characterId === 'kysilon' && !this.isSplitRider)) {
+          return finalize(0.08, 0.28, 0.32, 11, 300, -120, {
+            heavy: true,
+            limb: 'handR',
+            reach: 28 * this.scale,
+            useWeapon: false,
+            weaponType: null,
+            hitstop: 0.036,
+            shake: 4.8,
+          });
+        }
+        if (this.characterId === 'nguoisoi' && this.isWolfForm) {
+          return finalize(0.08, 0.28, 0.32, 9, 210, -135, {
+            heavy: false,
+            limb: 'handR',
+            reach: 26 * this.scale,
+            useWeapon: false,
+            weaponType: null,
+            hitstop: 0.024,
+            shake: 3.2,
+          });
+        }
         const kickShoeBonus = !armed && this.characterDef.affinity.unarmed === 'strong' ? 7 * this.scale : 0;
         return finalize(0.08, 0.28, 0.32, 8, 190, -140, {
           heavy: false,
@@ -2204,6 +2599,24 @@ export class StickFighter {
     x: number;
     y: number;
   } {
+    if (this.characterId === 'lon') {
+      if (this.action === 'SWEEP_KICK') {
+        return {
+          x: this.x + this.facing * 24 * this.scale,
+          y: this.y - 6 * this.scale,
+        };
+      }
+      return {
+        x: this.x + this.facing * 32 * this.scale,
+        y: this.y - 26 * this.scale,
+      };
+    }
+    if (this.characterId === 'kysilon' && !this.isSplitRider && this.action === 'SLIDE') {
+      return {
+        x: this.x + this.facing * 32 * this.scale,
+        y: this.y - 26 * this.scale,
+      };
+    }
     const base = this.joints[spec.limb];
     if (spec.useWeapon && this.weapon) {
       const vec = this.getWeaponVector();
@@ -2252,6 +2665,8 @@ export class StickFighter {
       exceptArmored?: string[];
       breaksCombo?: boolean;
       stunDuration?: number;
+      calloutOverride?: string;
+      attackerWolfClaw?: boolean;
     },
   ): TakeHitResult {
     if (
@@ -2267,8 +2682,9 @@ export class StickFighter {
     }
 
     const wDef = weaponSource ? WEAPONS[weaponSource] : null;
-    const effKbX = kbX * this.characterDef.knockbackTaken;
-    const effKbY = kbY * this.characterDef.knockbackTaken;
+    const kbTakenStat = this.getEffectiveKnockbackTakenStat();
+    const effKbX = kbX * kbTakenStat;
+    const effKbY = kbY * kbTakenStat;
 
     // 0. HAMMER_2 spinning sweep grants Super Armor against knockback & combo interruption!
     const hammer2Armored =
@@ -2604,6 +3020,7 @@ export class StickFighter {
       this.vx = attackerDir * kbApplied;
       this.vy = effKbY * 0.45;
       this.comboQueue = [];
+      this.isTransformingWolf = false;
       if (this.hp <= 0) {
         this.startAction('KNOCKDOWN', 0.9);
       } else {
@@ -2623,6 +3040,8 @@ export class StickFighter {
       sfx.playShieldClang(true);
     } else if (weaponSource) {
       sfx.playWeaponHit(weaponSource);
+    } else if (opts?.attackerWolfClaw) {
+      sfx.playWolfClaw();
     } else {
       sfx.playHit(heavy || this.hp <= 0);
     }
@@ -2804,6 +3223,42 @@ export class StickFighter {
           seed: Math.random() * 150,
         });
       }
+    } else if (opts?.attackerWolfClaw) {
+      // Wolf claw slash marks + sharp sparks
+      for (let i = 0; i < 3; i++) {
+        const slashAng = -0.68 + (i - 1) * 0.24;
+        particles.push({
+          x: impactX + (i - 1) * 5 * this.scale,
+          y: impactY + (i - 1) * 5 * this.scale,
+          vx: attackerDir * (42 + i * 18),
+          vy: (i - 1) * 18,
+          life: 0.24,
+          maxLife: 0.24,
+          size: (20 + (heavy ? 7 : 0)) * this.scale,
+          color: i === 1 ? '#DC2626' : '#0F172A',
+          kind: 'slash',
+          angle: slashAng,
+          spin: 0,
+          seed: Math.random() * 140,
+        });
+      }
+      for (let i = 0; i < (heavy ? 8 : 5); i++) {
+        const ang = (Math.PI * 2 * i) / (heavy ? 8 : 5) + (Math.random() - 0.5) * 0.35;
+        particles.push({
+          x: impactX,
+          y: impactY,
+          vx: Math.cos(ang) * 150 + attackerDir * 50,
+          vy: Math.sin(ang) * 150 - 25,
+          life: 0.24,
+          maxLife: 0.24,
+          size: (heavy ? 9.5 : 6.5) * this.scale,
+          color: i % 2 === 0 ? '#FACC15' : '#DC2626',
+          kind: 'spark',
+          angle: ang,
+          spin: 4,
+          seed: Math.random() * 160,
+        });
+      }
     } else {
       // Unarmed standard impact sparks
       const sparkCount = heavy ? 12 : 7;
@@ -2832,12 +3287,23 @@ export class StickFighter {
       : heavy
         ? ['BỐP!', 'CHÁT!', 'RẦM!']
         : ['BỤP!', 'HỰ!', 'BỐP!'];
+    const calloutText = opts?.calloutOverride
+      ? opts.calloutOverride
+      : opts?.homeRun
+        ? 'HOME RUN!'
+        : words[Math.floor(Math.random() * words.length)];
     callouts.push({
       x: impactX + (Math.random() - 0.5) * 18,
       y: impactY - 26 * this.scale,
       vy: -45,
-      text: opts?.homeRun ? 'HOME RUN!' : words[Math.floor(Math.random() * words.length)],
-      color: opts?.homeRun ? '#D97706' : weaponSource === 'hammer' || heavy ? '#B91C1C' : '#1E293B',
+      text: calloutText,
+      color: opts?.homeRun
+        ? '#D97706'
+        : opts?.calloutOverride === 'PHẬP!'
+          ? '#7C3AED'
+          : weaponSource === 'hammer' || heavy
+            ? '#B91C1C'
+            : '#1E293B',
       life: opts?.homeRun ? 0.92 : heavy ? 0.65 : 0.46,
       maxLife: opts?.homeRun ? 0.92 : heavy ? 0.65 : 0.46,
       scale: opts?.homeRun ? 1.38 : weaponSource === 'hammer' ? 1.3 : heavy ? 1.15 : 0.92,
@@ -2906,6 +3372,11 @@ export class StickFighter {
     this.vx = attackerDir * effKbX;
     this.vy = effKbY;
 
+    // Light paper-flutter tumble when Ninja takes strong knockback
+    if (this.characterId === 'ninja' && !opts?.homeRun && (heavy || effKbY < -50 * this.scale)) {
+      this.bodySpinRate = attackerDir * 7.5;
+    }
+
     if (this.hp <= 0) {
       if (this.action === 'TAKEOFF_FLIGHT') {
         this.wingsCrumpled = true;
@@ -2920,6 +3391,7 @@ export class StickFighter {
       }
       this.comboQueue = [];
       this.isRecoverySliding = false;
+      this.isTransformingWolf = false;
       this.startAction('KNOCKDOWN', 0.9);
       return { actualDamage: damage, hitConnected: true, fullyBlocked: false, armored: false, appliedKbX: effKbX };
     }
@@ -2935,6 +3407,7 @@ export class StickFighter {
     }
 
     this.comboQueue = [];
+    this.isTransformingWolf = false;
 
     if (opts?.pin) {
       const basePin = this.characterDef.affinity.spear === 'weak' ? 1.4 : 0.95;
@@ -3048,6 +3521,8 @@ export class StickFighter {
     timeNow: number,
     looseShieldX: number | null = null,
     arenaTraps: ArenaTrapSnapshot[] = [],
+    allies: StickFighter[] = [],
+    canEnterVictory = true,
   ) {
     this.arenaMinX = minX;
     this.arenaMaxX = maxX;
@@ -3061,6 +3536,22 @@ export class StickFighter {
     if (this.defenseCooldown > 0) this.defenseCooldown = Math.max(0, this.defenseCooldown - dt);
     if (this.rollCooldown > 0) this.rollCooldown = Math.max(0, this.rollCooldown - dt);
     if (this.rollInvulnTimer > 0) this.rollInvulnTimer = Math.max(0, this.rollInvulnTimer - dt);
+    if (this.pigHeadbuttCooldown > 0) {
+      this.pigHeadbuttCooldown = Math.max(0, this.pigHeadbuttCooldown - dt);
+    }
+    if (this.escapeLeapCooldown > 0) {
+      const prevCd = this.escapeLeapCooldown;
+      this.escapeLeapCooldown = Math.max(0, this.escapeLeapCooldown - dt);
+      if (prevCd > 0 && this.escapeLeapCooldown <= 0) {
+        this.escapeLeapReadyAnimTimer = 0.2;
+      }
+    }
+    if (this.escapeLeapReadyAnimTimer > 0) {
+      this.escapeLeapReadyAnimTimer = Math.max(0, this.escapeLeapReadyAnimTimer - dt);
+    }
+    if (this.action === 'KO') {
+      this.koEraseTimer += dt;
+    }
     if (this.slowTimer > 0) this.slowTimer = Math.max(0, this.slowTimer - dt);
     if (this.homeRunTimer > 0) this.homeRunTimer = Math.max(0, this.homeRunTimer - dt);
     if (this.terrainHitCooldown > 0) this.terrainHitCooldown = Math.max(0, this.terrainHitCooldown - dt);
@@ -3122,6 +3613,114 @@ export class StickFighter {
       this.pendingOverreachEffect = true;
     }
 
+    // Deterministic < 30% HP hold-ground posture for Kỵ Sĩ Lợn (AI-only, zero stat buffs, zero RNG)
+    const holdThreshold = this.characterDef.ai.holdBelowHp;
+    if (
+      holdThreshold !== undefined &&
+      !this.hasTriggeredHoldGround &&
+      fightingActive &&
+      this.hp > 0 &&
+      this.hp <= this.maxHp * holdThreshold
+    ) {
+      this.hasTriggeredHoldGround = true;
+    }
+
+    // Ninja deterministic < 30% HP cautious center-waiting posture (aiOnly, oncePerMatch, no stat buffs)
+    const ninjaWaitThresh = this.characterDef.ai.waitBelowHp;
+    if (
+      this.characterDef.trait.id === 'escapeLeap' &&
+      ninjaWaitThresh !== undefined &&
+      !this.hasTriggeredNinjaDefense &&
+      fightingActive &&
+      this.hp > 0 &&
+      this.hp < this.maxHp * ninjaWaitThresh
+    ) {
+      this.hasTriggeredNinjaDefense = true;
+    }
+
+    // Người Sói ("moonForm") lifecycle: deterministic transform at 80 moonGauge, 8s linear drain, and clean KO revert
+    if (this.wolfPantTimer > 0) {
+      this.wolfPantTimer = Math.max(0, this.wolfPantTimer - dt);
+    }
+    if (this.characterDef.trait.id === 'moonForm' && this.characterDef.trait.moonForm) {
+      const moonCfg = this.characterDef.trait.moonForm;
+      const maxG = moonCfg.maxGauge ?? 80;
+      if (this.hp <= 0 || this.action === 'KO') {
+        if (this.isWolfForm || this.isTransformingWolf) {
+          this.isWolfForm = false;
+          this.isTransformingWolf = false;
+          if (this.wolfStashedWeapon && !this.weapon) {
+            this.weapon = this.wolfStashedWeapon;
+          }
+          this.wolfStashedWeapon = null;
+          this.refreshEffectiveScale();
+        }
+      } else if (this.isWolfForm) {
+        if (fightingActive && !this.isDragged) {
+          const drainRate = maxG / Math.max(0.5, moonCfg.drainDuration ?? 8.0);
+          this.moonGauge = Math.max(0, this.moonGauge - drainRate * dt);
+          this.wolfDroolTimer -= dt;
+          if (this.wolfDroolTimer <= 0 && particles.length < 64) {
+            this.wolfDroolTimer = this.isAttacking() ? 0.18 : 0.38;
+            particles.push({
+              x: this.joints.head.x + this.facing * 14 * this.scale,
+              y: this.joints.head.y + 5 * this.scale,
+              vx: this.vx * 0.25 + this.facing * 12 * this.scale,
+              vy: 28 * this.scale,
+              life: 0.42,
+              maxLife: 0.42,
+              size: 3.1 * this.scale,
+              color: '#DC2626',
+              kind: 'drool',
+              angle: 0,
+              spin: 0,
+              seed: (this.seedBase + Math.floor(timeNow * 12)) % 120,
+            });
+          }
+          if (this.moonGauge <= 0) {
+            this.isWolfForm = false;
+            this.weapon = this.wolfStashedWeapon;
+            this.wolfStashedWeapon = null;
+            this.comboQueue = [];
+            this.refreshEffectiveScale();
+            this.pendingWolfRevertEffect = true;
+            this.wolfPantTimer = 0.75;
+            sfx.playWolfRevert();
+            for (let fi = 0; fi < 8; fi++) {
+              const ang = (Math.PI * 2 * fi) / 8 + 0.2;
+              particles.push({
+                x: this.x + Math.cos(ang) * 10 * this.scale,
+                y: this.joints.shoulder.y + Math.sin(ang) * 10 * this.scale,
+                vx: Math.cos(ang) * 95 * this.scale,
+                vy: Math.sin(ang) * 55 * this.scale - 35 * this.scale,
+                life: 0.5,
+                maxLife: 0.5,
+                size: 5.5 * this.scale,
+                color: this.color,
+                kind: 'fur',
+                angle: ang,
+                spin: (fi % 2 === 0 ? 1 : -1) * 5,
+                seed: this.seedBase + fi * 19,
+              });
+            }
+          }
+        }
+      } else if (
+        !this.isTransformingWolf &&
+        fightingActive &&
+        !this.isDragged &&
+        this.moonGauge >= maxG &&
+        this.action === 'STANCE'
+      ) {
+        this.isTransformingWolf = true;
+        this.comboQueue = [];
+        this.vx = 0;
+        this.vy = 0;
+        sfx.playWolfHowl();
+        this.startAction('TAUNT', moonCfg.transformDuration ?? 0.5);
+      }
+    }
+
     // Generic temporary status ticking
     if (this.tempStatuses.length > 0) {
       for (const st of this.tempStatuses) {
@@ -3133,6 +3732,9 @@ export class StickFighter {
     // Hề Bóng Bay Finale ("MÀN CUỐI!") & Out-of-tricks ("HẾT TRÒ") lifecycle + confetti trail
     if (this.characterDef.trait.id === 'gagBag' && this.characterDef.trait.finale) {
       const fin = this.characterDef.trait.finale;
+      const finDuration = fin.duration ?? 6;
+      const finMoveSpeedMul = fin.moveSpeedMul ?? 1.25;
+      const finOutOfTricks = fin.thenOutOfTricks;
       if (
         this.finaleState === 'unused' &&
         fightingActive &&
@@ -3141,13 +3743,13 @@ export class StickFighter {
         this.hp < this.maxHp * fin.belowHp
       ) {
         this.finaleState = 'active';
-        this.finaleTimer = fin.duration;
+        this.finaleTimer = finDuration;
         this.pendingFinaleCallout = true;
         sfx.playClownFinale();
         this.addTempStatus({
           id: 'clownFinale',
-          duration: fin.duration,
-          moveSpeedMul: fin.moveSpeedMul,
+          duration: finDuration,
+          moveSpeedMul: finMoveSpeedMul,
           label: 'MÀN CUỐI!',
         });
         // Celebratory confetti pop
@@ -3190,15 +3792,15 @@ export class StickFighter {
             seed: Math.random() * 140,
           });
         }
-        if (this.finaleTimer <= 0) {
+        if (this.finaleTimer <= 0 && finOutOfTricks) {
           this.finaleState = 'outOfTricks';
-          this.outOfTricksTimer = fin.thenOutOfTricks.duration;
+          this.outOfTricksTimer = finOutOfTricks.duration;
           this.pendingOutOfTricksCallout = true;
           sfx.playBalloonDeflate();
           this.addTempStatus({
             id: 'outOfTricks',
-            duration: fin.thenOutOfTricks.duration,
-            recoveryMul: fin.thenOutOfTricks.recoveryMul,
+            duration: finOutOfTricks.duration,
+            recoveryMul: finOutOfTricks.recoveryMul,
             label: 'HẾT TRÒ',
           });
         }
@@ -3387,45 +3989,149 @@ export class StickFighter {
     this.lastOpponentDist = absDist;
     this.currentRangeZone = this.classifyRangeZone(absDist);
 
+    // Corner pressure tracker for mounted Kỵ Sĩ Lợn (when backed into paper margin & pressured)
+    if (
+      this.characterId === 'kysilon' &&
+      !this.isSplitRider &&
+      fightingActive &&
+      this.hp > 0 &&
+      opponent.hp > 0 &&
+      (this.x - minX < 75 * this.scale || maxX - this.x < 75 * this.scale) &&
+      absDist < Math.max(115 * this.scale, this.getWeaponReach() * 1.18)
+    ) {
+      this.cornerPressTimer += dt;
+    } else {
+      this.cornerPressTimer = Math.max(0, this.cornerPressTimer - dt * 2);
+    }
+
+    // Decor-only particles for pig / mounted Kỵ Sĩ Lợn (no collision/hitboxes)
+    const isPigVisualActive =
+      this.characterId === 'lon' || (this.characterId === 'kysilon' && !this.isSplitRider);
+    if (isPigVisualActive && this.hp > 0 && this.action !== 'KO') {
+      // Orange nose steam during dash or pig headbutt lunge
+      if (this.action === 'DASH' || this.action === 'SLIDE') {
+        this.pigNoseSteamTimer -= dt;
+        if (this.pigNoseSteamTimer <= 0 && particles.length < 62) {
+          this.pigNoseSteamTimer = 0.08;
+          particles.push({
+            x: this.x + this.facing * 26 * this.scale,
+            y: this.y - 26 * this.scale,
+            vx: -this.facing * (35 + (this.seedBase % 15)) * this.scale,
+            vy: -22 * this.scale,
+            life: 0.28,
+            maxLife: 0.28,
+            size: 4.5 * this.scale,
+            color: '#F97316',
+            kind: 'steam',
+            angle: 0,
+            spin: 1.5,
+            seed: (this.seedBase + Math.floor(timeNow * 10)) % 120,
+          });
+        }
+      }
+      // Hoof dust puffs while trotting or charging across paper
+      if (
+        this.y >= floorY - 2 &&
+        ((this.action === 'STANCE' && Math.abs(this.vx) > 65 * this.scale) || this.action === 'DASH')
+      ) {
+        const hoofStride = Math.sin(timeNow * 16 + this.seedBase);
+        const hoofSign = hoofStride >= 0 ? 1 : -1;
+        if (this.lastPigHoofSign !== 0 && hoofSign !== this.lastPigHoofSign && particles.length < 60) {
+          this.spawnDust(particles, 1);
+        }
+        this.lastPigHoofSign = hoofSign;
+      } else {
+        this.lastPigHoofSign = 0;
+      }
+    }
+    // Low-HP sweat drops for Kỵ Sĩ Lợn & Lợn Chiến
+    if (
+      (this.characterId === 'kysilon' || this.characterId === 'lon') &&
+      this.hp > 0 &&
+      this.hp <= this.maxHp * 0.4 &&
+      this.action !== 'KO'
+    ) {
+      this.pigSweatTimer -= dt;
+      if (this.pigSweatTimer <= 0 && particles.length < 62) {
+        this.pigSweatTimer = 0.42;
+        particles.push({
+          x: this.joints.head.x - this.facing * 8 * this.scale,
+          y: this.joints.head.y - 8 * this.scale,
+          vx: -this.facing * 22 * this.scale,
+          vy: -24 * this.scale,
+          life: 0.34,
+          maxLife: 0.34,
+          size: 3.0 * this.scale,
+          color: '#0284C7',
+          kind: 'oil',
+          angle: 0,
+          spin: 0,
+          seed: (this.seedBase + Math.floor(timeNow * 8)) % 100,
+        });
+      }
+    }
+
     // 2. AI decision making & combo-escape / shield defense when fighting is active
     if (fightingActive && this.hp > 0) {
-      // Combo escape while in HURT hitstun when taking consecutive hits or opponent winds up next strike
-      const canDodge = this.characterDef.ai.style !== 'steadyAdvance';
-      if (
-        this.action === 'HURT' &&
-        this.actionTime >= 0.05 &&
-        this.defenseCooldown <= 0 &&
-        opponent.hp > 0 &&
-        absDist < 118 * this.scale &&
-        (opponent.isAttacking() || this.consecutiveHitsTaken >= 1)
-      ) {
-        this.defenseCooldown = 0.22;
-        const escapeChance = Math.min(
-          0.65,
-          0.2 + this.consecutiveHitsTaken * 0.16 + (this.hasShield ? 0.12 : 0),
-        );
-        if (Math.random() < escapeChance) {
-          this.facing = dirToOpp;
-          this.comboQueue = [];
-          if (this.hasShield && Math.random() < 0.65) {
-            this.vx = -dirToOpp * 65 * this.scale * this.characterDef.knockbackTaken;
-            this.startAction('SHIELD_CROUCH', 0.46);
-            this.defenseCooldown = 0.52;
-          } else if (canDodge) {
-            const dodgeMult = this.characterDef.affinity.unarmed === 'good' ? 0.5 : 1;
-            if (Math.random() < dodgeMult) {
-              this.vx = -dirToOpp * 345 * this.scale * this.getEffectiveMoveSpeed();
-              this.vy = -215 * this.scale;
-              this.startAction('DODGE_BACK', 0.36);
-              this.spawnDust(particles, 4);
-              sfx.playDodge();
+      if (this.characterDef.trait.id === 'escapeLeap') {
+        if (this.action === 'HURT' && this.actionTime >= 0.03) {
+          this.tryTriggerEscapeLeap(opponent, minX, maxX);
+        }
+      } else {
+        // Combo escape while in HURT hitstun when taking consecutive hits or opponent winds up next strike
+        const canDodge =
+          this.characterDef.ai.style !== 'steadyAdvance' &&
+          this.characterDef.ai.style !== 'frontliner' &&
+          !(this.characterId === 'kysilon' && this.hasTriggeredHoldGround) &&
+          !(this.characterId === 'nguoisoi' && (this.isWolfForm || this.hasTriggeredHoldGround));
+        if (
+          this.action === 'HURT' &&
+          this.actionTime >= 0.05 &&
+          this.defenseCooldown <= 0 &&
+          opponent.hp > 0 &&
+          absDist < 118 * this.scale &&
+          (opponent.isAttacking() || this.consecutiveHitsTaken >= 1)
+        ) {
+          this.defenseCooldown = 0.22;
+          const escapeChance = Math.min(
+            0.65,
+            0.2 + this.consecutiveHitsTaken * 0.16 + (this.hasShield ? 0.12 : 0),
+          );
+          if (Math.random() < escapeChance) {
+            this.facing = dirToOpp;
+            this.comboQueue = [];
+            if (this.hasShield && Math.random() < 0.65) {
+              this.vx = -dirToOpp * 65 * this.scale * this.getEffectiveKnockbackTakenStat();
+              this.startAction('SHIELD_CROUCH', 0.46);
               this.defenseCooldown = 0.52;
+            } else if (canDodge) {
+              const dodgeMult = this.characterDef.affinity.unarmed === 'good' ? 0.5 : 1;
+              if (Math.random() < dodgeMult) {
+                this.vx = -dirToOpp * 345 * this.scale * this.getEffectiveMoveSpeed();
+                this.vy = -215 * this.scale;
+                this.startAction('DODGE_BACK', 0.36);
+                this.spawnDust(particles, 4);
+                sfx.playDodge();
+                this.defenseCooldown = 0.52;
+              }
             }
           }
         }
       }
 
-      this.updateAI(dt, opponent, absDist, dirToOpp, minX, maxX, particles, looseShieldX, arenaTraps);
+      this.updateAI(
+        dt,
+        opponent,
+        absDist,
+        dirToOpp,
+        minX,
+        maxX,
+        particles,
+        looseShieldX,
+        arenaTraps,
+        allies,
+        canEnterVictory,
+      );
     } else if (
       !fightingActive &&
       this.action !== 'IDLE_WAIT' &&
@@ -3447,6 +4153,7 @@ export class StickFighter {
     if (
       this.action === 'ENTRANCE_JUMP' ||
       this.action === 'ROLL_DODGE' ||
+      this.action === 'LEAP_OVER' ||
       this.action === 'TAKEOFF_FLIGHT' ||
       this.action === 'TAKEOFF_LAND_STUCK'
     ) {
@@ -3475,6 +4182,7 @@ export class StickFighter {
     if (
       this.action !== 'ENTRANCE_JUMP' &&
       this.action !== 'ROLL_DODGE' &&
+      this.action !== 'LEAP_OVER' &&
       this.action !== 'TAKEOFF_FLIGHT' &&
       this.action !== 'TAKEOFF_LAND_STUCK' &&
       this.y >= floorY
@@ -3630,6 +4338,8 @@ export class StickFighter {
       !opponent.isDragged &&
       !this.isAirborne() &&
       !opponent.isAirborne() &&
+      this.action !== 'LEAP_OVER' &&
+      opponent.action !== 'LEAP_OVER' &&
       absDist < minSep &&
       Math.abs(this.y - opponent.y) < 55 * Math.max(this.hitboxScale, opponent.hitboxScale)
     ) {
@@ -3638,8 +4348,61 @@ export class StickFighter {
       this.x = clamp(this.x + sign * push * 0.5, minX, maxX);
     }
 
+    // Allied unit separation so same-team units (e.g. Lợn Chiến & Kỵ Sĩ) never walk through/overlap each other on ground
+    for (const ally of allies) {
+      if (
+        ally === this ||
+        !fightingActive ||
+        this.hp <= 0 ||
+        ally.hp <= 0 ||
+        this.isDragged ||
+        ally.isDragged ||
+        this.isAirborne() ||
+        ally.isAirborne() ||
+        this.action === 'LEAP_OVER' ||
+        ally.action === 'LEAP_OVER'
+      ) {
+        continue;
+      }
+      const allyDist = Math.abs(this.x - ally.x);
+      const allyMinSep = 18 * this.hitboxScale + 18 * ally.hitboxScale;
+      if (
+        allyDist < allyMinSep &&
+        Math.abs(this.y - ally.y) < 55 * Math.max(this.hitboxScale, ally.hitboxScale)
+      ) {
+        const push = (allyMinSep - allyDist) * 0.5;
+        const sign =
+          this.x < ally.x ? -1 : this.x > ally.x ? 1 : this.isSplitRider ? -this.facing : this.facing;
+        this.x = clamp(this.x + sign * push * 0.65, minX, maxX);
+      }
+    }
+
     // 5. Update pose smoothly (or stepped coarseMotion for mechanical fighters like Lon Sắt)
     const targetPose = this.buildActionPose(timeNow);
+    if (
+      this.characterId === 'kysilon' &&
+      !this.isSplitRider &&
+      this.action !== 'KO' &&
+      this.action !== 'KNOCKDOWN' &&
+      this.action !== 'SLIP' &&
+      this.action !== 'PINNED'
+    ) {
+      // Mounted rider straddles the saddle; subtle trot bounce while moving
+      const trot = Math.abs(this.vx) > 20 * this.scale ? Math.abs(Math.sin(timeNow * 14)) * 3.0 : 0;
+      targetPose.hipDrop -= trot;
+      targetPose.thighL = 0.66;
+      targetPose.kneeL = 1.24;
+      targetPose.thighR = -0.18;
+      targetPose.kneeR = 1.12;
+      if (this.action === 'SLIDE') {
+        targetPose.torsoLean = 0.42;
+        targetPose.headTilt = -0.12;
+        targetPose.upperArmL = 0.92;
+        targetPose.elbowL = 1.15;
+        targetPose.upperArmR = 0.65;
+        targetPose.elbowR = 1.2;
+      }
+    }
     if (this.characterDef.coarseMotion) {
       const stepInterval = 1 / Math.max(1, this.characterDef.jitterFps || 5);
       this.coarsePoseTimer += dt;
@@ -3654,7 +4417,9 @@ export class StickFighter {
           ? this.characterId === 'nhoc'
             ? 30
             : 22
-          : 13;
+          : this.action === 'LEAP_OVER'
+            ? 26
+            : 13;
       this.pose = lerpPose(this.pose, targetPose, clamp(dt * blendSpeed, 0, 1));
     }
 
@@ -3696,10 +4461,14 @@ export class StickFighter {
     particles: Particle[],
     looseShieldX: number | null,
     arenaTraps: ArenaTrapSnapshot[] = [],
+    allies: StickFighter[] = [],
+    canEnterVictory = true,
   ) {
     if (opponent.hp <= 0) {
-      if (this.action === 'STANCE' || this.action === 'DASH' || this.action === 'BACKSTEP') {
+      if (canEnterVictory && (this.action === 'STANCE' || this.action === 'DASH' || this.action === 'BACKSTEP')) {
         this.startAction('VICTORY', 0);
+      } else if (!canEnterVictory) {
+        this.vx = lerp(this.vx, 0, clamp(dt * 10, 0, 1));
       }
       return;
     }
@@ -3733,11 +4502,17 @@ export class StickFighter {
     this.facing = dirToOpp;
     const slowMult = this.slowTimer > 0 ? 0.62 : 1;
     const spdMult = this.getEffectiveMoveSpeed() * slowMult;
-    const steady = this.characterDef.ai.style === 'steadyAdvance';
-    const hitAndRun = this.characterDef.ai.style === 'hitAndRun';
-    const zoner = this.characterDef.ai.style === 'zoner';
-    const boilerAI = this.characterDef.ai.style === 'boiler';
-    const pranksterAI = this.characterDef.ai.style === 'prankster';
+    const aiStyle = this.getEffectiveAIStyle();
+    const steady = aiStyle === 'steadyAdvance';
+    const hitAndRun = aiStyle === 'hitAndRun';
+    const zoner = aiStyle === 'zoner';
+    const boilerAI = aiStyle === 'boiler';
+    const pranksterAI = aiStyle === 'prankster';
+    const skirmisherAI = aiStyle === 'skirmisher';
+    const gladiatorRiderAI = aiStyle === 'gladiatorRider';
+    const frontlinerAI = aiStyle === 'frontliner';
+    const weaponUserAI = aiStyle === 'weaponUser';
+    const moonHunterAI = aiStyle === 'moonHunter';
     this.aiCooldown -= dt * (this.slowTimer > 0 ? 0.72 : 1);
 
     const wDef = this.weapon ? WEAPONS[this.weapon] : null;
@@ -3746,11 +4521,138 @@ export class StickFighter {
 
     const idealRange = 54 * this.scale + reachBonus;
     const kickRange = 68 * this.scale + reachBonus * 0.85;
+    const aliveAllyPig = allies.find((a) => a.hp > 0 && !a.isDragged) ?? null;
 
-    // Move toward unclaimed shield if nearby and shieldless, otherwise engage opponent
-    if (!this.hasShield && looseShieldX !== null && Math.abs(looseShieldX - this.x) < 210 * this.scale) {
+    // Move toward unclaimed shield if nearby and shieldless (pigs and transformed wolves never equip shields/weapons)
+    if (
+      !this.characterDef.trait.neverEquipWeapon &&
+      !this.isWolfForm &&
+      !this.isTransformingWolf &&
+      !this.hasShield &&
+      looseShieldX !== null &&
+      Math.abs(looseShieldX - this.x) < 210 * this.scale
+    ) {
       const shieldDir = looseShieldX >= this.x ? 1 : -1;
       this.vx = lerp(this.vx, shieldDir * 225 * this.scale * spdMult, clamp(dt * 9, 0, 1));
+    } else if (moonHunterAI) {
+      const R = this.getWeaponReach();
+      if (this.isWolfForm) {
+        // Wolf form: relentless forward chase, never retreats backward
+        const desiredDist = 0.58 * R;
+        if (absDist > desiredDist + 10 * this.scale) {
+          this.vx = lerp(this.vx, dirToOpp * 228 * this.scale * spdMult, clamp(dt * 10, 0, 1));
+        } else {
+          this.vx = lerp(this.vx, dirToOpp * 65 * this.scale * spdMult, clamp(dt * 10, 0, 1));
+        }
+      } else {
+        const halfMoonPush = Boolean(this.characterDef.ai.pushWhenMoonHalfFull && this.moonGauge >= 40);
+        const prefRatio =
+          typeof this.characterDef.ai.preferredRange === 'number'
+            ? this.characterDef.ai.preferredRange
+            : 0.75;
+        const prefDist = (halfMoonPush ? Math.min(prefRatio, 0.62) : prefRatio) * R;
+        if (absDist > prefDist + 14 * this.scale) {
+          this.vx = lerp(this.vx, dirToOpp * (halfMoonPush ? 205 : 185) * this.scale * spdMult, clamp(dt * 9, 0, 1));
+        } else if (absDist < prefDist * 0.56 && !this.hasTriggeredHoldGround && !halfMoonPush) {
+          this.vx = lerp(this.vx, -dirToOpp * 145 * this.scale * spdMult, clamp(dt * 9, 0, 1));
+        } else {
+          this.vx = lerp(this.vx, Math.sin(this.actionTime * 5.2 + this.seedBase) * 42 * this.scale * spdMult, clamp(dt * 9, 0, 1));
+        }
+      }
+    } else if (frontlinerAI) {
+      // Split Lợn Chiến: charges relentlessly straight ahead, never backs up
+      const R = this.getWeaponReach();
+      if (absDist > 0.6 * R) {
+        this.vx = lerp(this.vx, dirToOpp * 215 * this.scale * spdMult, clamp(dt * 10, 0, 1));
+      } else {
+        this.vx = lerp(this.vx, dirToOpp * 75 * this.scale * spdMult, clamp(dt * 10, 0, 1));
+      }
+    } else if (weaponUserAI) {
+      // Split Rider: stays tucked safely behind living Lợn Chiến when possible, steps in when enemy engages pig or in reach
+      const R = this.getWeaponReach();
+      if (aliveAllyPig) {
+        const enemyEngagingPig =
+          Math.abs(opponent.x - aliveAllyPig.x) < 115 * this.scale ||
+          opponent.action === 'HURT' ||
+          opponent.action === 'KNOCKDOWN' ||
+          opponent.action === 'PINNED';
+        const oppSideToPig: 1 | -1 = opponent.x >= aliveAllyPig.x ? 1 : -1;
+        const behindPigX = clamp(aliveAllyPig.x - oppSideToPig * 62 * this.scale, minX + 18 * this.scale, maxX - 18 * this.scale);
+        const desiredX = enemyEngagingPig
+          ? clamp(opponent.x - dirToOpp * (R * 0.78), minX, maxX)
+          : behindPigX;
+        const dxTarget = desiredX - this.x;
+        if (Math.abs(dxTarget) > 14 * this.scale) {
+          this.vx = lerp(this.vx, Math.sign(dxTarget) * 195 * this.scale * spdMult, clamp(dt * 9, 0, 1));
+        } else {
+          this.vx = lerp(this.vx, 0, clamp(dt * 12, 0, 1));
+        }
+      } else {
+        const prefDist = 0.78 * R;
+        if (absDist > prefDist + 14 * this.scale) {
+          this.vx = lerp(this.vx, dirToOpp * 190 * this.scale * spdMult, clamp(dt * 9, 0, 1));
+        } else if (absDist < prefDist * 0.62 && !this.hasTriggeredHoldGround) {
+          this.vx = lerp(this.vx, -dirToOpp * 135 * this.scale * spdMult, clamp(dt * 9, 0, 1));
+        } else {
+          this.vx = lerp(this.vx, 0, clamp(dt * 12, 0, 1));
+        }
+      }
+    } else if (gladiatorRiderAI) {
+      // Pre-split Kỵ Sĩ Lợn: steady mid-range (0.7R), bounces in place without backing up to farm momentum
+      const R = this.getWeaponReach();
+      const prefDist = 0.7 * R;
+      if (absDist > prefDist + 16 * this.scale) {
+        this.vx = lerp(this.vx, dirToOpp * 188 * this.scale * spdMult, clamp(dt * 8, 0, 1));
+      } else if (absDist < prefDist * 0.45 && !this.hasTriggeredHoldGround) {
+        this.vx = lerp(this.vx, dirToOpp * 35 * this.scale * spdMult, clamp(dt * 8, 0, 1));
+      } else {
+        this.vx = lerp(this.vx, 0, clamp(dt * 13, 0, 1));
+      }
+    } else if (skirmisherAI) {
+      const R = this.getWeaponReach();
+      const basePref =
+        typeof this.characterDef.ai.preferredRange === 'number'
+          ? this.characterDef.ai.preferredRange
+          : 0.6;
+      const oppVulnerable =
+        opponent.action === 'HURT' ||
+        opponent.action === 'PINNED' ||
+        opponent.action === 'KNOCKDOWN' ||
+        opponent.action === 'GETUP' ||
+        opponent.action === 'SLIP' ||
+        opponent.isInRecoveryPhase();
+      const prefDist = (this.hasTriggeredNinjaDefense && !oppVulnerable ? 0.85 : basePref) * R;
+      const edgePad = 110 * this.scale;
+      const nearLeftWall = this.x - minX < edgePad;
+      const nearRightWall = maxX - this.x < edgePad;
+      const coolingEdgeDanger = Boolean(
+        this.characterDef.ai.avoidEdgeWhenTraitCooling && this.escapeLeapCooldown > 0,
+      );
+      const backTowardWall =
+        (dirToOpp === 1 && nearLeftWall) || (dirToOpp === -1 && nearRightWall);
+      const centerX = (minX + maxX) * 0.5;
+
+      if (
+        (this.hasTriggeredNinjaDefense || coolingEdgeDanger) &&
+        Math.min(this.x - minX, maxX - this.x) < 95 * this.scale &&
+        !oppVulnerable
+      ) {
+        // Angle back toward arena center rather than hugging paper edges
+        const toCenterDir = centerX >= this.x ? 1 : -1;
+        this.vx = lerp(this.vx, toCenterDir * 175 * this.scale * spdMult, clamp(dt * 9, 0, 1));
+      } else if (absDist > prefDist + 16 * this.scale) {
+        if (this.hasTriggeredNinjaDefense && !oppVulnerable && absDist < 1.35 * R) {
+          this.vx = lerp(this.vx, 0, clamp(dt * 12, 0, 1));
+        } else {
+          this.vx = lerp(this.vx, dirToOpp * 215 * this.scale * spdMult, clamp(dt * 10, 0, 1));
+        }
+      } else if (absDist < prefDist * 0.56 && !(coolingEdgeDanger && backTowardWall) && !this.hasTriggeredNinjaDefense) {
+        this.vx = lerp(this.vx, -dirToOpp * 155 * this.scale * spdMult, clamp(dt * 10, 0, 1));
+      } else if (this.characterDef.ai.holdInPlaceBounce) {
+        this.vx = lerp(this.vx, 0, clamp(dt * 14, 0, 1));
+      } else {
+        this.vx = lerp(this.vx, 0, clamp(dt * 10, 0, 1));
+      }
     } else if (pranksterAI) {
       const R = this.getWeaponReach();
       const oppSlipped = opponent.action === 'SLIP' || opponent.action === 'KNOCKDOWN' || opponent.action === 'PINNED';
@@ -3874,6 +4776,569 @@ export class StickFighter {
     }
 
     if (this.aiCooldown > 0) return;
+
+    // MoonHunter AI for Người Sói (human form paces & builds moon; wolf form rushes aggressively without retreating)
+    if (moonHunterAI) {
+      const moonMax = this.characterDef.trait.moonForm?.maxGauge ?? 80;
+      if (!this.isWolfForm && !this.isTransformingWolf && this.moonGauge >= moonMax) {
+        // Stay in STANCE one tick so deterministic moonForm trigger immediately starts 0.5s TAUNT transform
+        this.vx = 0;
+        return;
+      }
+      const R = this.getWeaponReach();
+      const oppVulnerable =
+        opponent.action === 'HURT' ||
+        opponent.action === 'PINNED' ||
+        opponent.action === 'KNOCKDOWN' ||
+        opponent.action === 'GETUP' ||
+        opponent.action === 'SLIP' ||
+        opponent.isInRecoveryPhase();
+      const wolfAgg = this.characterDef.ai.aggressionByForm?.wolf ?? 0.85;
+      const humanAgg =
+        this.characterDef.ai.pushWhenMoonHalfFull && this.moonGauge >= 40
+          ? 0.68
+          : (this.characterDef.ai.aggressionByForm?.human ?? 0.5);
+      const agg = this.isWolfForm ? wolfAgg : humanAgg;
+
+      // 1. Reactive defense on opponent windup (wolf form NEVER steps back — blocks or trades forward!)
+      if (
+        !this.isWolfForm &&
+        opponent.isAttacking() &&
+        !opponent.hasHitThisAction &&
+        absDist < Math.max(92 * this.scale, R * 0.95) &&
+        this.defenseCooldown <= 0
+      ) {
+        this.defenseCooldown = 0.28;
+        if (this.hasShield && Math.random() < 0.6) {
+          this.vx = -dirToOpp * 25 * this.scale;
+          this.startAction('SHIELD_CROUCH', 0.42);
+          this.aiCooldown = 0.18;
+          return;
+        }
+        if (this.hasTriggeredHoldGround || Math.random() < 0.62) {
+          this.startAction('BLOCK', 0.32);
+          this.aiCooldown = 0.16;
+          return;
+        }
+        this.vx = -dirToOpp * 235 * this.scale * spdMult;
+        this.vy = -125 * this.scale;
+        this.startAction('BACKSTEP', 0.24);
+        this.aiCooldown = 0.2;
+        return;
+      }
+
+      // 2. Throw shield if damaged while holding one in human form (weak shield affinity; avoid blocking wolf transform)
+      if (
+        !this.isWolfForm &&
+        this.hasShield &&
+        this.damageTakenWithShield >= 24 &&
+        absDist > 55 * this.scale &&
+        absDist < 340 * this.scale &&
+        Math.random() < 0.42
+      ) {
+        this.vx = dirToOpp * 75 * this.scale * spdMult;
+        this.startAction('SHIELD_THROW', this.getActionDuration('SHIELD_THROW'));
+        this.aiCooldown = 0.26;
+        return;
+      }
+
+      // 3. Gap closer: wolf form pounces with SLIDE from mid-range or sprints with DASH!
+      if (absDist > Math.max(kickRange + 14 * this.scale, R * 1.1)) {
+        if (this.isWolfForm) {
+          if (absDist <= 185 * this.scale && Math.random() < 0.62) {
+            this.vx = dirToOpp * 440 * this.scale * spdMult;
+            this.comboQueue = ['KICK', 'ROUNDHOUSE'];
+            this.shouldRetreatAfterCombo = false;
+            this.startAction('SLIDE', this.getActionDuration('SLIDE'));
+            this.spawnDust(particles, 5);
+            sfx.playWolfClaw();
+            this.aiCooldown = 0.16;
+          } else {
+            this.vx = dirToOpp * 425 * this.scale * spdMult;
+            this.startAction('DASH', 0.2);
+            this.spawnDust(particles, 3);
+            sfx.playWhoosh();
+            this.aiCooldown = 0.05;
+          }
+        } else if (oppVulnerable || Math.random() < agg + 0.18) {
+          this.vx = dirToOpp * 385 * this.scale * spdMult;
+          this.startAction('DASH', 0.21);
+          this.spawnDust(particles, 3);
+          sfx.playWhoosh();
+          this.aiCooldown = 0.06;
+        } else {
+          this.aiCooldown = 0.2;
+        }
+        return;
+      }
+
+      // 4. Wolf form claw/kick chains & human weapon/unarmed combos
+      const r = Math.random();
+      this.shouldRetreatAfterCombo = false;
+      if (this.isWolfForm || !this.weapon) {
+        if (this.isWolfForm) {
+          if (r < 0.38) {
+            this.vx = dirToOpp * 165 * this.scale * spdMult;
+            this.comboQueue = ['CROSS', 'ROUNDHOUSE'];
+            this.startAction('JAB', this.getActionDuration('JAB'));
+            this.aiCooldown = 0.14;
+          } else if (r < 0.7) {
+            this.vx = dirToOpp * 155 * this.scale * spdMult;
+            this.comboQueue = ['UPPERCUT', 'SWEEP_KICK'];
+            this.startAction('JAB', this.getActionDuration('JAB'));
+            this.aiCooldown = 0.15;
+          } else if (r < 0.86) {
+            this.vx = dirToOpp * 175 * this.scale * spdMult;
+            this.comboQueue = ['SWEEP_KICK'];
+            this.startAction('KICK', this.getActionDuration('KICK'));
+            this.aiCooldown = 0.16;
+          } else {
+            this.vx = dirToOpp * 125 * this.scale * spdMult;
+            this.comboQueue = [];
+            this.startAction('SUPER_PUNCH', this.getActionDuration('SUPER_PUNCH'));
+            this.aiCooldown = 0.22;
+          }
+        } else {
+          this.vx = dirToOpp * 135 * this.scale * spdMult;
+          if (r < 0.45) {
+            this.comboQueue = ['CROSS', 'SWEEP_KICK'];
+            this.startAction('JAB', this.getActionDuration('JAB'));
+          } else if (r < 0.78) {
+            this.comboQueue = ['UPPERCUT', 'ROUNDHOUSE'];
+            this.startAction('JAB', this.getActionDuration('JAB'));
+          } else {
+            this.comboQueue = ['ROUNDHOUSE'];
+            this.startAction('KICK', this.getActionDuration('KICK'));
+          }
+          this.aiCooldown = 0.22;
+        }
+      } else if (this.weapon === 'spear') {
+        if (absDist < 48 * this.scale) {
+          this.vx = this.hasTriggeredHoldGround ? 0 : -dirToOpp * 70 * this.scale;
+          this.comboQueue = ['SPEAR_2'];
+          this.startAction('SPEAR_BUTT', this.getActionDuration('SPEAR_BUTT'));
+        } else {
+          this.vx = dirToOpp * 125 * this.scale * spdMult;
+          this.comboQueue = r < 0.6 ? ['SPEAR_2', 'SPEAR_3'] : ['SPEAR_2'];
+          this.startAction('SPEAR_1', this.getActionDuration('SPEAR_1'));
+        }
+        this.aiCooldown = 0.25 * cdMult;
+      } else if (this.weapon === 'sword') {
+        const fin: FighterAction = absDist < 84 * this.scale ? 'SWORD_3' : 'SWORD_LUNGE';
+        this.vx = dirToOpp * 135 * this.scale * spdMult;
+        this.comboQueue = r < 0.5 ? ['SWORD_2', fin] : ['SWORD_2'];
+        this.startAction('SWORD_1', this.getActionDuration('SWORD_1'));
+        this.aiCooldown = 0.28 * cdMult;
+      } else if (this.weapon === 'bat') {
+        this.vx = dirToOpp * 135 * this.scale * spdMult;
+        this.comboQueue = r < 0.5 ? ['BAT_2', 'BAT_3'] : ['BAT_2'];
+        this.startAction('BAT_1', this.getActionDuration('BAT_1'));
+        this.aiCooldown = 0.3 * cdMult;
+      } else {
+        this.vx = dirToOpp * 115 * this.scale * spdMult;
+        this.comboQueue = r < 0.5 ? ['HAMMER_2', 'HAMMER_3'] : ['HAMMER_2'];
+        this.startAction('HAMMER_1', this.getActionDuration('HAMMER_1'));
+        this.aiCooldown = 0.36 * cdMult;
+      }
+      return;
+    }
+
+    // Frontliner AI for split Lợn Chiến: rushes straight in, uses ONLY SLIDE (headbutt), SWEEP_KICK (stomp), JAB (nudge)
+    if (frontlinerAI) {
+      const R = this.getWeaponReach();
+      if (absDist > 1.05 * R) {
+        this.vx = dirToOpp * 395 * this.scale * spdMult;
+        this.startAction('DASH', 0.22);
+        this.spawnDust(particles, 3);
+        sfx.playWhoosh();
+        this.aiCooldown = 0.06;
+        return;
+      }
+      if (absDist > 0.72 * R && Math.random() < 0.65) {
+        this.vx = dirToOpp * 425 * this.scale * spdMult;
+        this.comboQueue = ['SWEEP_KICK'];
+        this.startAction('SLIDE', this.getActionDuration('SLIDE'));
+        this.spawnDust(particles, 4);
+        sfx.playPigOink();
+        this.aiCooldown = 0.26;
+        return;
+      }
+      const r = Math.random();
+      this.shouldRetreatAfterCombo = false;
+      if (r < 0.36) {
+        this.vx = dirToOpp * 145 * this.scale * spdMult;
+        this.comboQueue = ['SWEEP_KICK'];
+        this.startAction('JAB', this.getActionDuration('JAB'));
+        this.aiCooldown = 0.26;
+      } else if (r < 0.72) {
+        this.vx = dirToOpp * 135 * this.scale * spdMult;
+        this.startAction('SWEEP_KICK', this.getActionDuration('SWEEP_KICK'));
+        sfx.playPigStomp();
+        this.spawnDust(particles, 4);
+        this.aiCooldown = 0.28;
+      } else {
+        this.vx = dirToOpp * 380 * this.scale * spdMult;
+        this.startAction('SLIDE', this.getActionDuration('SLIDE'));
+        sfx.playPigOink();
+        this.aiCooldown = 0.28;
+      }
+      return;
+    }
+
+    // GladiatorRider AI for pre-split Kỵ Sĩ Lợn
+    if (gladiatorRiderAI) {
+      const R = this.getWeaponReach();
+      // 1. Cornered & pressured -> pig automatically headbutts forward out on cooldown
+      if (this.cornerPressTimer >= 1.0 && this.pigHeadbuttCooldown <= 0) {
+        this.pigHeadbuttCooldown = this.characterDef.ai.pigHeadbuttCooldown ?? 3.2;
+        this.cornerPressTimer = 0;
+        this.vx = dirToOpp * 425 * this.scale * spdMult;
+        this.shouldRetreatAfterCombo = false;
+        this.startAction('SLIDE', this.getActionDuration('SLIDE'));
+        this.spawnDust(particles, 4);
+        sfx.playPigOink();
+        this.aiCooldown = 0.24;
+        return;
+      }
+      // 2. Reactive guard (never BACKSTEP when < 30% hold ground active)
+      if (
+        opponent.isAttacking() &&
+        !opponent.hasHitThisAction &&
+        absDist < Math.max(92 * this.scale, R * 0.95) &&
+        this.defenseCooldown <= 0
+      ) {
+        this.defenseCooldown = 0.28;
+        if (this.hasShield && Math.random() < 0.6) {
+          this.vx = -dirToOpp * 25 * this.scale;
+          this.startAction('SHIELD_CROUCH', 0.42);
+          this.aiCooldown = 0.2;
+          return;
+        }
+        if (this.hasTriggeredHoldGround || Math.random() < 0.65) {
+          this.startAction('BLOCK', 0.34);
+          this.aiCooldown = 0.18;
+          return;
+        }
+        this.vx = -dirToOpp * 225 * this.scale * spdMult;
+        this.vy = -120 * this.scale;
+        this.startAction('BACKSTEP', 0.24);
+        this.aiCooldown = 0.2;
+        return;
+      }
+      // 3. Shield throw (weak shield affinity)
+      if (
+        this.hasShield &&
+        this.damageTakenWithShield >= 24 &&
+        absDist > 55 * this.scale &&
+        absDist < 340 * this.scale &&
+        Math.random() < 0.42
+      ) {
+        this.vx = dirToOpp * 70 * this.scale * spdMult;
+        this.startAction('SHIELD_THROW', this.getActionDuration('SHIELD_THROW'));
+        this.aiCooldown = 0.28;
+        return;
+      }
+      // 4. Close gap cleanly
+      if (absDist > Math.max(kickRange + 18 * this.scale, R * 1.14)) {
+        this.vx = dirToOpp * 385 * this.scale * spdMult;
+        this.startAction('DASH', 0.22);
+        this.spawnDust(particles, 3);
+        sfx.playWhoosh();
+        this.aiCooldown = 0.06;
+        return;
+      }
+      // 5. Execute weapon or mounted combos
+      const r = Math.random();
+      this.shouldRetreatAfterCombo = false;
+      if (this.weapon === 'spear') {
+        if (absDist < 48 * this.scale) {
+          this.vx = this.hasTriggeredHoldGround ? 0 : -dirToOpp * 70 * this.scale;
+          this.comboQueue = ['SPEAR_2'];
+          this.startAction('SPEAR_BUTT', this.getActionDuration('SPEAR_BUTT'));
+        } else {
+          this.vx = dirToOpp * 125 * this.scale * spdMult;
+          this.comboQueue = r < 0.55 ? ['SPEAR_2', 'SPEAR_3'] : ['SPEAR_2'];
+          this.startAction('SPEAR_1', this.getActionDuration('SPEAR_1'));
+        }
+        this.aiCooldown = 0.28 * cdMult;
+      } else if (this.weapon === 'sword') {
+        const fin: FighterAction = absDist < 82 * this.scale ? 'SWORD_3' : 'SWORD_LUNGE';
+        this.vx = dirToOpp * 135 * this.scale * spdMult;
+        this.comboQueue = r < 0.48 ? ['SWORD_2', fin] : ['SWORD_2'];
+        this.startAction('SWORD_1', this.getActionDuration('SWORD_1'));
+        this.aiCooldown = 0.28 * cdMult;
+      } else if (this.weapon === 'bat') {
+        this.vx = dirToOpp * 135 * this.scale * spdMult;
+        this.comboQueue = r < 0.55 ? ['BAT_2', 'BAT_3'] : ['BAT_2'];
+        this.startAction('BAT_1', this.getActionDuration('BAT_1'));
+        this.aiCooldown = 0.3 * cdMult;
+      } else if (this.weapon === 'hammer') {
+        this.vx = dirToOpp * 125 * this.scale * spdMult;
+        this.comboQueue = r < 0.5 ? ['HAMMER_2', 'HAMMER_3'] : ['HAMMER_2'];
+        this.startAction('HAMMER_1', this.getActionDuration('HAMMER_1'));
+        this.aiCooldown = 0.36 * cdMult;
+      } else if (r < 0.45) {
+        this.vx = dirToOpp * 125 * this.scale * spdMult;
+        this.comboQueue = ['CROSS', 'SWEEP_KICK'];
+        this.startAction('JAB', this.getActionDuration('JAB'));
+        this.aiCooldown = 0.24;
+      } else if (r < 0.78) {
+        this.vx = dirToOpp * 135 * this.scale * spdMult;
+        this.comboQueue = ['ROUNDHOUSE'];
+        this.startAction('KICK', this.getActionDuration('KICK'));
+        this.aiCooldown = 0.26;
+      } else {
+        this.vx = dirToOpp * 375 * this.scale * spdMult;
+        this.comboQueue = ['SWEEP_KICK'];
+        this.startAction('SLIDE', this.getActionDuration('SLIDE'));
+        sfx.playPigOink();
+        this.aiCooldown = 0.26;
+      }
+      return;
+    }
+
+    // WeaponUser AI for split Kỵ Sĩ Lợn rider
+    if (weaponUserAI) {
+      const R = this.getWeaponReach();
+      if (
+        opponent.isAttacking() &&
+        !opponent.hasHitThisAction &&
+        absDist < Math.max(90 * this.scale, R * 0.95) &&
+        this.defenseCooldown <= 0
+      ) {
+        this.defenseCooldown = 0.26;
+        if (this.hasShield && Math.random() < 0.6) {
+          this.vx = -dirToOpp * 25 * this.scale;
+          this.startAction('SHIELD_CROUCH', 0.42);
+          this.aiCooldown = 0.18;
+          return;
+        }
+        if (this.hasTriggeredHoldGround || !aliveAllyPig || Math.random() < 0.5) {
+          this.startAction('BLOCK', 0.32);
+          this.aiCooldown = 0.16;
+          return;
+        }
+        this.vx = -dirToOpp * 250 * this.scale * spdMult;
+        this.vy = -125 * this.scale;
+        this.startAction('BACKSTEP', 0.24);
+        this.aiCooldown = 0.2;
+        return;
+      }
+      if (
+        this.hasShield &&
+        this.damageTakenWithShield >= 22 &&
+        absDist > 55 * this.scale &&
+        absDist < 340 * this.scale &&
+        Math.random() < 0.45
+      ) {
+        this.vx = dirToOpp * 75 * this.scale * spdMult;
+        this.startAction('SHIELD_THROW', this.getActionDuration('SHIELD_THROW'));
+        this.aiCooldown = 0.28;
+        return;
+      }
+      const enemyEngagingPig =
+        !aliveAllyPig ||
+        Math.abs(opponent.x - aliveAllyPig.x) < 120 * this.scale ||
+        opponent.action === 'HURT' ||
+        opponent.action === 'KNOCKDOWN' ||
+        opponent.action === 'PINNED';
+      if (absDist > Math.max(kickRange + 16 * this.scale, R * 1.14)) {
+        if (enemyEngagingPig && Math.random() < 0.72) {
+          this.vx = dirToOpp * 380 * this.scale * spdMult;
+          this.startAction('DASH', 0.2);
+          this.spawnDust(particles, 3);
+          sfx.playWhoosh();
+          this.aiCooldown = 0.08;
+        } else {
+          this.aiCooldown = 0.18;
+        }
+        return;
+      }
+      const r = Math.random();
+      this.shouldRetreatAfterCombo = Boolean(aliveAllyPig) && !this.hasTriggeredHoldGround && r < 0.58;
+      if (this.weapon === 'spear') {
+        if (absDist < 46 * this.scale) {
+          this.vx = this.hasTriggeredHoldGround ? 0 : -dirToOpp * 75 * this.scale;
+          this.comboQueue = ['SPEAR_2'];
+          this.startAction('SPEAR_BUTT', this.getActionDuration('SPEAR_BUTT'));
+        } else {
+          this.vx = dirToOpp * 120 * this.scale * spdMult;
+          this.comboQueue = r < 0.55 ? ['SPEAR_2', 'SPEAR_3'] : ['SPEAR_2'];
+          this.startAction('SPEAR_1', this.getActionDuration('SPEAR_1'));
+        }
+        this.aiCooldown = 0.26 * cdMult;
+      } else if (this.weapon === 'sword') {
+        const fin: FighterAction = absDist < 82 * this.scale ? 'SWORD_3' : 'SWORD_LUNGE';
+        this.vx = dirToOpp * 130 * this.scale * spdMult;
+        this.comboQueue = r < 0.5 ? ['SWORD_2', fin] : ['SWORD_2'];
+        this.startAction('SWORD_1', this.getActionDuration('SWORD_1'));
+        this.aiCooldown = 0.26 * cdMult;
+      } else if (this.weapon === 'bat') {
+        this.vx = dirToOpp * 130 * this.scale * spdMult;
+        this.comboQueue = r < 0.5 ? ['BAT_2', 'BAT_3'] : ['BAT_2'];
+        this.startAction('BAT_1', this.getActionDuration('BAT_1'));
+        this.aiCooldown = 0.28 * cdMult;
+      } else if (this.weapon === 'hammer') {
+        this.vx = dirToOpp * 115 * this.scale * spdMult;
+        this.comboQueue = r < 0.5 ? ['HAMMER_2', 'HAMMER_3'] : ['HAMMER_2'];
+        this.startAction('HAMMER_1', this.getActionDuration('HAMMER_1'));
+        this.aiCooldown = 0.34 * cdMult;
+      } else if (r < 0.5) {
+        this.vx = dirToOpp * 120 * this.scale * spdMult;
+        this.comboQueue = ['CROSS', 'SWEEP_KICK'];
+        this.startAction('JAB', this.getActionDuration('JAB'));
+        this.aiCooldown = 0.22;
+      } else {
+        this.vx = dirToOpp * 125 * this.scale * spdMult;
+        this.comboQueue = ['ROUNDHOUSE'];
+        this.startAction('KICK', this.getActionDuration('KICK'));
+        this.aiCooldown = 0.24;
+      }
+      return;
+    }
+
+    // Skirmisher AI ("BÓNG LƯỚT") for Ninja — strict forward/back/jump horizontal decisions
+    if (skirmisherAI) {
+      const R = this.getWeaponReach();
+      const oppVulnerable =
+        opponent.action === 'HURT' ||
+        opponent.action === 'PINNED' ||
+        opponent.action === 'KNOCKDOWN' ||
+        opponent.action === 'GETUP' ||
+        opponent.action === 'SLIP' ||
+        opponent.isInRecoveryPhase();
+      const agg = this.hasTriggeredNinjaDefense ? 0.35 : (this.characterDef.ai.aggression ?? 0.55);
+      const edgePad = 110 * this.scale;
+      const nearLeftWall = this.x - minX < edgePad;
+      const nearRightWall = maxX - this.x < edgePad;
+      const backTowardWall =
+        (dirToOpp === 1 && nearLeftWall) || (dirToOpp === -1 && nearRightWall);
+      const coolingEdgeDanger = Boolean(
+        this.characterDef.ai.avoidEdgeWhenTraitCooling && this.escapeLeapCooldown > 0,
+      );
+
+      // 1. Reactive guard on enemy windup close
+      if (
+        opponent.isAttacking() &&
+        !opponent.hasHitThisAction &&
+        absDist < Math.max(92 * this.scale, R * 0.95) &&
+        this.defenseCooldown <= 0
+      ) {
+        this.defenseCooldown = 0.26;
+        if (this.hasShield && Math.random() < 0.62) {
+          this.vx = -dirToOpp * 25 * this.scale;
+          this.startAction('SHIELD_CROUCH', 0.44);
+          this.aiCooldown = 0.18;
+          return;
+        }
+        if ((coolingEdgeDanger && backTowardWall) || this.hasTriggeredNinjaDefense || Math.random() < 0.55) {
+          this.startAction('BLOCK', 0.32);
+          this.aiCooldown = 0.16;
+          return;
+        }
+        this.vx = -dirToOpp * 255 * this.scale * spdMult;
+        this.vy = -125 * this.scale;
+        this.startAction('BACKSTEP', 0.24);
+        this.aiCooldown = 0.18;
+        return;
+      }
+
+      // 2. Throw shield if damaged while holding one (weak shield affinity)
+      if (
+        this.hasShield &&
+        this.damageTakenWithShield >= 26 &&
+        absDist > 55 * this.scale &&
+        absDist < 340 * this.scale &&
+        Math.random() < 0.42
+      ) {
+        this.vx = dirToOpp * 75 * this.scale * spdMult;
+        this.startAction('SHIELD_THROW', this.getActionDuration('SHIELD_THROW'));
+        this.aiCooldown = 0.28;
+        return;
+      }
+
+      // 3. Gap closer: straight DASH or low SLIDE into strike range
+      if (absDist > Math.max(kickRange + 16 * this.scale, R * 1.12)) {
+        if (oppVulnerable || (!this.hasTriggeredNinjaDefense && Math.random() < agg + 0.16)) {
+          if (!this.weapon && absDist < 175 * this.scale && Math.random() < 0.45) {
+            this.vx = dirToOpp * 400 * this.scale * spdMult;
+            this.comboQueue = ['KICK'];
+            this.shouldRetreatAfterCombo = !(coolingEdgeDanger && backTowardWall) && !oppVulnerable;
+            this.startAction('SLIDE', this.getActionDuration('SLIDE'));
+            this.spawnDust(particles, 3);
+            sfx.playWhoosh();
+            this.aiCooldown = 0.22;
+          } else {
+            this.vx = dirToOpp * 410 * this.scale * spdMult;
+            this.startAction('DASH', 0.2);
+            this.spawnDust(particles, 3);
+            sfx.playWhoosh();
+            this.aiCooldown = 0.06;
+          }
+        } else {
+          this.aiCooldown = 0.24;
+        }
+        return;
+      }
+
+      // 4. Below 30% HP cautious wait: hold center spacing unless opponent is open
+      if (this.hasTriggeredNinjaDefense && !oppVulnerable && Math.random() > agg) {
+        this.aiCooldown = 0.22;
+        return;
+      }
+
+      // 5. Strike execution tailored to weapon affinities
+      const r = Math.random();
+      this.shouldRetreatAfterCombo =
+        !(coolingEdgeDanger && backTowardWall) && !this.hasTriggeredNinjaDefense && !oppVulnerable && r < 0.45;
+
+      if (this.weapon === 'sword') {
+        const fin: FighterAction = absDist < 84 * this.scale ? 'SWORD_3' : 'SWORD_LUNGE';
+        this.vx = dirToOpp * 135 * this.scale * spdMult;
+        this.comboQueue = r < 0.45 ? ['SWORD_2', fin] : r < 0.78 ? [fin] : ['SWORD_2'];
+        this.startAction('SWORD_1', this.getActionDuration('SWORD_1'));
+        this.aiCooldown = 0.26 * cdMult;
+      } else if (this.weapon === 'spear') {
+        if (absDist < 46 * this.scale) {
+          this.vx = coolingEdgeDanger && backTowardWall ? 0 : -dirToOpp * 75 * this.scale;
+          this.comboQueue = ['SPEAR_2'];
+          this.startAction('SPEAR_BUTT', this.getActionDuration('SPEAR_BUTT'));
+        } else {
+          this.vx = dirToOpp * 120 * this.scale * spdMult;
+          this.comboQueue = r < 0.55 ? ['SPEAR_2', 'SPEAR_3'] : ['SPEAR_2'];
+          this.startAction('SPEAR_1', this.getActionDuration('SPEAR_1'));
+        }
+        this.aiCooldown = 0.26 * cdMult;
+      } else if (this.weapon === 'bat') {
+        this.vx = dirToOpp * 135 * this.scale * spdMult;
+        this.comboQueue = r < 0.55 ? ['BAT_2', 'BAT_3'] : ['BAT_2'];
+        this.startAction('BAT_1', this.getActionDuration('BAT_1'));
+        this.aiCooldown = 0.28 * cdMult;
+      } else if (this.weapon === 'hammer') {
+        this.vx = dirToOpp * 115 * this.scale * spdMult;
+        this.comboQueue = r < 0.5 ? ['HAMMER_2'] : ['HAMMER_3'];
+        this.startAction('HAMMER_1', this.getActionDuration('HAMMER_1'));
+        this.aiCooldown = 0.36 * cdMult;
+      } else {
+        // Unarmed good affinity: crisp fast strikes & agile kicks
+        this.vx = dirToOpp * 165 * this.scale * spdMult;
+        if (r < 0.42) {
+          this.comboQueue = ['CROSS', 'ROUNDHOUSE'];
+          this.startAction('JAB', this.getActionDuration('JAB'));
+        } else if (r < 0.74) {
+          this.comboQueue = ['SWEEP_KICK'];
+          this.startAction('CROSS', this.getActionDuration('CROSS'));
+        } else if (r < 0.9) {
+          this.comboQueue = [];
+          this.startAction('ROUNDHOUSE', this.getActionDuration('ROUNDHOUSE'));
+        } else {
+          this.comboQueue = [];
+          this.startAction('KICK', this.getActionDuration('KICK'));
+        }
+        this.aiCooldown = 0.22;
+      }
+      return;
+    }
 
     // Prankster AI ("CHƠI XỎ") for Hề Bóng Bay
     if (pranksterAI) {
@@ -4872,6 +6337,8 @@ export class StickFighter {
         return 0.38;
       case 'ROLL_DODGE':
         return this.characterDef.trait.invuln ?? 0.25;
+      case 'LEAP_OVER':
+        return this.characterDef.trait.leap?.duration ?? 0.62;
       case 'SLIDE':
         return this.scaleAttackTiming(act, 0.08, 0.28, 0.32).duration;
       case 'PINNED':
@@ -4926,6 +6393,53 @@ export class StickFighter {
     }
 
     if (this.action === 'TAUNT') {
+      if (this.isTransformingWolf) {
+        this.vx *= Math.pow(0.002, dt);
+        if (Math.floor((this.actionTime - dt) * 14) !== Math.floor(this.actionTime * 14) && particles.length < 64) {
+          const idx = Math.floor(this.actionTime * 14);
+          const moonX = this.joints.head.x - this.facing * 20 * this.scale;
+          const moonY = this.joints.head.y - 24 * this.scale;
+          particles.push({
+            x: moonX + ((idx % 3) - 1) * 5 * this.scale,
+            y: moonY + 4 * this.scale,
+            vx: (this.x - moonX) * 1.4,
+            vy: 95 * this.scale,
+            life: 0.28,
+            maxLife: 0.28,
+            size: 16 * this.scale,
+            color: '#FACC15',
+            kind: 'moonBeam',
+            angle: Math.atan2(this.joints.shoulder.y - moonY, this.x - moonX),
+            spin: 0,
+            seed: this.seedBase + idx * 17,
+          });
+          particles.push({
+            x: this.x + ((idx % 5) - 2) * 5 * this.scale,
+            y: this.joints.shoulder.y + ((idx % 3) - 1) * 8 * this.scale,
+            vx: ((idx % 2 === 0 ? 1 : -1) * (45 + (idx % 3) * 20)) * this.scale,
+            vy: (-55 - (idx % 4) * 15) * this.scale,
+            life: 0.36,
+            maxLife: 0.36,
+            size: 5.5 * this.scale,
+            color: this.color,
+            kind: 'fur',
+            angle: idx * 0.9,
+            spin: (idx % 2 === 0 ? 1 : -1) * 5,
+            seed: this.seedBase + idx * 23,
+          });
+        }
+        if (this.actionTime >= this.actionDuration) {
+          this.isTransformingWolf = false;
+          this.isWolfForm = true;
+          this.wolfStashedWeapon = this.weapon;
+          this.weapon = null;
+          this.comboQueue = [];
+          this.refreshEffectiveScale();
+          this.pendingWolfTransformEffect = true;
+          this.startAction('STANCE', 0);
+        }
+        return;
+      }
       if (this.actionTime >= this.actionDuration) {
         this.facing = this.side === 'left' ? 1 : -1;
         this.startAction('IDLE_WAIT', 0);
@@ -5281,6 +6795,61 @@ export class StickFighter {
       return;
     }
 
+    // Ninja Escape Leap ("Nhảy qua đầu thoát góc") high/far arc + clear mid-air turn & shuriken throw
+    if (this.action === 'LEAP_OVER') {
+      const dur = Math.max(0.18, this.actionDuration);
+      const p = clamp(this.actionTime / dur, 0, 1);
+      const smooth = p * p * (3 - 2 * p);
+      this.x = clamp(lerp(this.leapStartX, this.leapTargetX, smooth), minX, maxX);
+      const arcH = (this.characterDef.trait.leap?.arcHeight ?? 165) * this.scale;
+      this.y = floorY - Math.sin(p * Math.PI) * arcH;
+
+      const spinDir: 1 | -1 = this.leapTargetX >= this.leapStartX ? 1 : -1;
+      if (p >= 0.1 && p <= 0.44) {
+        this.bodySpin = ((p - 0.1) / 0.34) * Math.PI * 2 * spinDir;
+      } else {
+        this.bodySpin = 0;
+      }
+
+      if (p > 0.44) {
+        this.facing = opponent.x >= this.x ? 1 : -1;
+      }
+
+      if (!this.triggeredLeapApex && p >= 0.52) {
+        this.triggeredLeapApex = true;
+        const sx = this.x + this.facing * 24 * this.scale;
+        const sy = this.y - 68 * this.scale;
+        const tx = opponent.x;
+        const ty = (opponent.joints.shoulder.y + opponent.joints.hip.y) * 0.5;
+        const dx = tx - sx;
+        const dy = ty - sy;
+        const dist = Math.hypot(dx, dy) || 1;
+        const speed = 460 * this.scale;
+        this.pendingShurikenThrow = {
+          x: sx,
+          y: sy,
+          vx: (dx / dist) * speed,
+          vy: (dy / dist) * speed,
+          ownerSide: this.side,
+          damage: this.characterDef.trait.shuriken?.damage ?? 7,
+        };
+      }
+
+      if (p >= 1) {
+        this.x = clamp(this.leapTargetX, minX, maxX);
+        this.y = floorY;
+        this.vx = 0;
+        this.vy = 0;
+        this.bodySpin = 0;
+        this.bodySpinRate = 0;
+        this.facing = opponent.x >= this.x ? 1 : -1;
+        this.spawnDust(particles, 4);
+        this.aiCooldown = 0.08;
+        this.startAction('STANCE', 0);
+      }
+      return;
+    }
+
     const spec = this.getAttackSpecs();
     if (spec && !this.hasPlayedWhoosh && this.actionTime >= spec.activeStart * 0.6) {
       this.hasPlayedWhoosh = true;
@@ -5371,7 +6940,7 @@ export class StickFighter {
         vx: throwVx,
         vy: throwVy,
         ownerSide: this.side,
-        damage: Math.round(throwDmg * this.characterDef.damageDealt),
+        damage: Math.round(throwDmg * this.getEffectiveDamageDealtStat()),
       };
       sfx.playShieldThrow();
       this.spawnDust(particles, 3);
@@ -5704,8 +7273,14 @@ export class StickFighter {
           this.vx = dirToOpp * 145 * this.scale * spd;
         }
         this.startAction(nextMove, this.getActionDuration(nextMove));
+        if (this.characterId === 'lon' && nextMove === 'SWEEP_KICK') {
+          sfx.playPigStomp();
+        }
       } else if (
         this.shouldRetreatAfterCombo &&
+        this.characterId !== 'lon' &&
+        !(this.characterId === 'kysilon' && this.hasTriggeredHoldGround) &&
+        !(this.characterId === 'nguoisoi' && (this.isWolfForm || this.hasTriggeredHoldGround)) &&
         opponent.hp > 0 &&
         !opponent.isDragged &&
         absDist < 145 * this.scale
@@ -5908,6 +7483,71 @@ export class StickFighter {
             thighR: -0.32,
             kneeR: 0.42,
           };
+        } else if (this.characterDef.entrance.tauntStyle === 'ninja_hand_seal') {
+          // Ninja low crouched focus hand-seal -> quick ready flick
+          const seal = p < 0.65 ? clamp(p / 0.25, 0, 1) : 1 - (p - 0.65) / 0.35;
+          return {
+            hipDrop: lerp(12, 16, seal),
+            torsoLean: 0.32,
+            headTilt: 0.04,
+            upperArmL: lerp(0.95, 1.38, seal),
+            elbowL: lerp(1.08, 1.85, seal),
+            upperArmR: lerp(-0.58, 1.25, seal),
+            elbowR: lerp(1.38, 1.82, seal),
+            thighL: 0.52,
+            kneeL: 0.78,
+            thighR: -0.44,
+            kneeR: 0.74,
+          };
+        } else if (this.characterDef.entrance.tauntStyle === 'kysilon_oink') {
+          const pump = Math.sin(p * Math.PI * 3);
+          return {
+            hipDrop: 6 - Math.abs(pump) * 3,
+            torsoLean: -0.06 + pump * 0.08,
+            headTilt: -0.08,
+            upperArmL: lerp(0.75, 1.75, Math.max(0, pump)),
+            elbowL: 0.85,
+            upperArmR: 0.55,
+            elbowR: 1.15,
+            thighL: 0.66,
+            kneeL: 1.24,
+            thighR: -0.18,
+            kneeR: 1.12,
+          };
+        } else if (this.characterDef.entrance.tauntStyle === 'howl') {
+          // Wolf howl: crouch gathering then arch spine & throw head skyward with clawed arms spread!
+          if (this.isTransformingWolf) {
+            const gather = p < 0.28 ? p / 0.28 : 1;
+            const howl = p < 0.28 ? 0 : clamp((p - 0.28) / 0.42, 0, 1);
+            const shake = Math.sin(p * 48) * 0.05;
+            return {
+              hipDrop: p < 0.28 ? lerp(12, 22, gather) : lerp(22, 10, howl),
+              torsoLean: p < 0.28 ? lerp(0.25, 0.52, gather) : lerp(0.52, -0.34, howl) + shake,
+              headTilt: p < 0.28 ? 0.12 : lerp(0.12, -0.58, howl),
+              upperArmL: p < 0.28 ? 0.9 : lerp(0.9, 1.85, howl),
+              elbowL: p < 0.28 ? 1.3 : lerp(1.3, 0.45, howl),
+              upperArmR: p < 0.28 ? 0.7 : lerp(0.7, -1.25, howl),
+              elbowR: p < 0.28 ? 1.3 : lerp(1.3, 0.45, howl),
+              thighL: 0.52,
+              kneeL: 0.82,
+              thighR: -0.44,
+              kneeR: 0.74,
+            };
+          }
+          const arch = Math.sin(p * Math.PI);
+          return {
+            hipDrop: lerp(12, 6, arch),
+            torsoLean: lerp(0.22, -0.28, arch),
+            headTilt: lerp(0.02, -0.46, arch),
+            upperArmL: lerp(0.75, 1.7, arch),
+            elbowL: lerp(1.2, 0.48, arch),
+            upperArmR: lerp(0.25, -1.05, arch),
+            elbowR: lerp(1.35, 0.52, arch),
+            thighL: 0.48,
+            kneeL: 0.68,
+            thighR: -0.4,
+            kneeR: 0.62,
+          };
         }
         // Stickman normal: gather crouch -> sharp martial fist-pump beckon
         if (p < 0.3) {
@@ -6046,6 +7686,42 @@ export class StickFighter {
             kneeR: 0.32,
           };
         }
+        if (this.characterId === 'ninja') {
+          const tiptoe = Math.abs(Math.sin(t * 7.4 + this.seedBase)) * 2.2;
+          const glanceCycle = ((t + this.seedBase * 0.011) % 2.9) / 2.9;
+          const glance = glanceCycle > 0.76 ? Math.sin(((glanceCycle - 0.76) / 0.24) * Math.PI) * 0.18 : 0;
+          return {
+            hipDrop: 12 - tiptoe,
+            torsoLean: 0.28,
+            headTilt: -0.04 + glance,
+            upperArmL: 0.92,
+            elbowL: 1.08,
+            upperArmR: -0.58,
+            elbowR: 1.38,
+            thighL: 0.48,
+            kneeL: 0.76,
+            thighR: -0.42,
+            kneeR: 0.72,
+          };
+        }
+        if (this.characterId === 'nguoisoi') {
+          const moonGlanceCycle = ((t + this.seedBase * 0.015) % 3.2) / 3.2;
+          const moonGlance = moonGlanceCycle > 0.72 ? Math.sin(((moonGlanceCycle - 0.72) / 0.28) * Math.PI) * -0.28 : 0;
+          const breathe = Math.sin(t * 4.2 + this.seedBase) * 1.6;
+          return {
+            hipDrop: 9 + breathe,
+            torsoLean: 0.22,
+            headTilt: moonGlance,
+            upperArmL: 0.52,
+            elbowL: 1.15,
+            upperArmR: -0.28,
+            elbowR: 1.52,
+            thighL: 0.36,
+            kneeL: 0.52,
+            thighR: -0.32,
+            kneeR: 0.48,
+          };
+        }
         const breathe = Math.sin(t * 3.4 + this.seedBase) * 1.8;
         const sway = Math.sin(t * 1.7 + this.seedBase) * 0.06;
         return {
@@ -6151,6 +7827,59 @@ export class StickFighter {
             kneeR: 0.42 + Math.max(0, duckStride) * 0.48,
           };
         }
+        if (this.characterId === 'ninja') {
+          const tiptoe = Math.abs(Math.sin(t * 10.5 + this.seedBase)) * (moveRatio < 0.15 ? 2.6 : 1.8);
+          const stride = Math.sin(t * 17) * 0.56 * moveRatio;
+          const lowHpDeep = this.hp > 0 && this.hp < this.maxHp * 0.3 ? 4 : 0;
+          const hammerHunch = this.weapon === 'hammer' ? 0.2 : 0;
+          return {
+            hipDrop: 13 + lowHpDeep - tiptoe,
+            torsoLean: 0.34 + hammerHunch + moveRatio * 0.14,
+            headTilt: -0.06,
+            upperArmL: 0.92 + Math.sin(t * 10.5) * 0.06,
+            elbowL: 1.05,
+            upperArmR: -0.62,
+            elbowR: 1.36,
+            thighL: 0.52 + stride,
+            kneeL: 0.78 + Math.max(0, -stride) * 0.55,
+            thighR: -0.44 - stride,
+            kneeR: 0.72 + Math.max(0, stride) * 0.55,
+          };
+        }
+        if (this.characterId === 'nguoisoi') {
+          if (this.isWolfForm) {
+            const stride = Math.sin(t * 18) * 0.62 * moveRatio;
+            const prowlBob = Math.sin(t * 12 + this.seedBase) * 2.2;
+            return {
+              hipDrop: 15 + prowlBob,
+              torsoLean: 0.46 + moveRatio * 0.2,
+              headTilt: -0.18,
+              upperArmL: 0.88 + Math.sin(t * 12) * 0.08,
+              elbowL: 0.55,
+              upperArmR: 0.42 - Math.sin(t * 12) * 0.08,
+              elbowR: 0.72,
+              thighL: 0.58 + stride,
+              kneeL: 0.86 + Math.max(0, -stride) * 0.52,
+              thighR: -0.48 - stride,
+              kneeR: 0.82 + Math.max(0, stride) * 0.52,
+            };
+          }
+          const pant = this.wolfPantTimer > 0 ? Math.abs(Math.sin(t * 19)) * 3.5 : 0;
+          const stride = Math.sin(t * 13) * 0.48 * moveRatio;
+          return {
+            hipDrop: 10 + pant,
+            torsoLean: 0.24 + moveRatio * 0.14 + (this.wolfPantTimer > 0 ? 0.12 : 0),
+            headTilt: this.wolfPantTimer > 0 ? 0.14 : -0.06,
+            upperArmL: 0.76,
+            elbowL: 1.24,
+            upperArmR: 0.34,
+            elbowR: 1.44,
+            thighL: 0.42 + stride,
+            kneeL: 0.56 + Math.max(0, -stride) * 0.46,
+            thighR: -0.34 - stride,
+            kneeR: 0.48 + Math.max(0, stride) * 0.46,
+          };
+        }
         const bounce = Math.sin(t * 9 + this.seedBase) * 2.5;
         const stride = Math.sin(t * 13) * 0.48 * moveRatio;
         return {
@@ -6169,6 +7898,38 @@ export class StickFighter {
       }
 
       case 'DASH': {
+        if (this.characterId === 'nguoisoi' && this.isWolfForm) {
+          const stride = Math.sin(t * 25) * 0.72;
+          return {
+            hipDrop: 16,
+            torsoLean: 0.72,
+            headTilt: -0.34,
+            upperArmL: 1.05 + stride * 0.35,
+            elbowL: 0.35,
+            upperArmR: 0.55 - stride * 0.35,
+            elbowR: 0.48,
+            thighL: 0.72 + stride,
+            kneeL: 0.92,
+            thighR: -0.66 - stride,
+            kneeR: 0.55,
+          };
+        }
+        if (this.characterId === 'ninja') {
+          const stride = Math.sin(t * 24) * 0.65;
+          return {
+            hipDrop: 14,
+            torsoLean: 0.62,
+            headTilt: -0.28,
+            upperArmL: -0.78,
+            elbowL: 0.45,
+            upperArmR: -0.88,
+            elbowR: 0.4,
+            thighL: 0.62 + stride,
+            kneeL: 0.85,
+            thighR: -0.58 - stride,
+            kneeR: 0.45,
+          };
+        }
         return {
           hipDrop: 10,
           torsoLean: 0.52,
@@ -6181,6 +7942,71 @@ export class StickFighter {
           kneeL: 0.85,
           thighR: -0.68,
           kneeR: 0.3,
+        };
+      }
+
+      case 'LEAP_OVER': {
+        if (p < 0.12) {
+          const coil = p / 0.12;
+          return {
+            hipDrop: lerp(13, 21, coil),
+            torsoLean: 0.48,
+            headTilt: -0.1,
+            upperArmL: 0.7,
+            elbowL: 1.25,
+            upperArmR: -0.65,
+            elbowR: 1.35,
+            thighL: 0.85,
+            kneeL: 1.45,
+            thighR: 0.55,
+            kneeR: 1.35,
+          };
+        }
+        if (p <= 0.44) {
+          return {
+            hipDrop: 6,
+            torsoLean: 0.72,
+            headTilt: -0.18,
+            upperArmL: 0.9,
+            elbowL: 1.4,
+            upperArmR: -0.65,
+            elbowR: 1.35,
+            thighL: 1.35,
+            kneeL: 1.95,
+            thighR: 1.15,
+            kneeR: 1.95,
+          };
+        }
+        if (p <= 0.84) {
+          // Clearly visible mid-air windup (0.44..0.52) -> whip-throw forward/down (0.52..0.70) -> follow-through
+          const snap = p <= 0.52 ? 0 : clamp((p - 0.52) / 0.14, 0, 1);
+          return {
+            hipDrop: 5,
+            torsoLean: lerp(0.18, 0.38, snap),
+            headTilt: 0.12,
+            upperArmL: lerp(2.65, 1.08, snap),
+            elbowL: lerp(0.95, 0.08, snap),
+            upperArmR: -0.78,
+            elbowR: 1.25,
+            thighL: 0.88,
+            kneeL: 1.35,
+            thighR: -0.35,
+            kneeR: 1.15,
+          };
+        }
+        const land = (p - 0.84) / 0.16;
+        return {
+          hipDrop: lerp(18, 12, land),
+          torsoLean: 0.36,
+          headTilt: 0.08,
+          upperArmL: 0.92,
+          elbowL: 1.08,
+          upperArmR: -0.58,
+          elbowR: 1.38,
+          thighL: 0.62,
+          kneeL: 1.05,
+          thighR: -0.45,
+          kneeR: 0.95,
         };
       }
 
@@ -6379,6 +8205,23 @@ export class StickFighter {
       }
 
       case 'SLIDE': {
+        if (this.characterId === 'nguoisoi' && this.isWolfForm) {
+          // Wolf pounce lunge forward with outstretched claws!
+          const pounceArc = Math.sin(p * Math.PI);
+          return {
+            hipDrop: lerp(18, 8, pounceArc),
+            torsoLean: 0.78,
+            headTilt: -0.38,
+            upperArmL: 1.72,
+            elbowL: 0.18,
+            upperArmR: 1.88,
+            elbowR: 0.12,
+            thighL: -0.35,
+            kneeL: 0.68,
+            thighR: -0.78,
+            kneeR: 0.42,
+          };
+        }
         return {
           hipDrop: 24,
           torsoLean: -0.68,
@@ -6974,6 +8817,22 @@ export class StickFighter {
             kneeR: 0.45,
           };
         }
+        if (this.characterId === 'ninja') {
+          const rebound = p < 0.38 ? p / 0.38 : 1 - (p - 0.38) / 0.62;
+          return {
+            hipDrop: lerp(12, 22, rebound),
+            torsoLean: -0.42 * rebound - 0.08,
+            headTilt: -0.24,
+            upperArmL: -0.35,
+            elbowL: 0.75,
+            upperArmR: -0.75,
+            elbowR: 0.65,
+            thighL: 0.48,
+            kneeL: 0.82,
+            thighR: -0.45,
+            kneeR: 0.72,
+          };
+        }
         return {
           hipDrop: 6,
           torsoLean: -0.45,
@@ -7149,8 +9008,16 @@ export class StickFighter {
     const thighLen = 23 * s * visual.legRatio * reachMul;
     const shinLen = 23 * s * visual.legRatio * reachMul;
     const legStandingHeight = thighLen + shinLen;
+    const isMountedKySi =
+      this.characterId === 'kysilon' &&
+      !this.isSplitRider &&
+      this.action !== 'KO' &&
+      this.action !== 'KNOCKDOWN' &&
+      this.action !== 'SLIP' &&
+      this.action !== 'PINNED';
+    const saddleOffsetY = isMountedKySi ? -22 * s : 0;
     const hipX = this.x;
-    const hipY = baseY - legStandingHeight + this.pose.hipDrop * s;
+    const hipY = baseY - legStandingHeight + this.pose.hipDrop * s + saddleOffsetY;
 
     const torsoLen = 33 * s * visual.torsoRatio;
     const shoulderX = hipX + Math.sin(this.pose.torsoLean) * torsoLen * f;
@@ -7222,11 +9089,14 @@ export class StickFighter {
     const footRX = kneeRX + Math.sin(shinAngleR) * shinLen * f;
     const footRY = kneeRY + Math.cos(shinAngleR) * shinLen;
 
-    // Ground foot clamping when not knocked down / dragged / jumping / rolling
+    // Ground foot clamping when not knocked down / dragged / jumping / rolling / mounted / pig
     if (
+      !isMountedKySi &&
+      this.characterId !== 'lon' &&
       !this.isDragged &&
       this.action !== 'ENTRANCE_JUMP' &&
       this.action !== 'ROLL_DODGE' &&
+      this.action !== 'LEAP_OVER' &&
       this.action !== 'TAKEOFF_FLIGHT' &&
       !(this.action === 'TAKEOFF_LAND_STUCK' && !this.takeoffDiveComplete) &&
       this.action !== 'KNOCKDOWN' &&
@@ -7338,14 +9208,15 @@ export class StickFighter {
     const j = this.joints;
     const s = this.scale;
     const visual = this.characterDef.visual;
+    const effJitterFps = this.getEffectiveJitterFps();
     const charBoilTick =
-      visual.jitterFps !== 8 && nowMs !== undefined
-        ? Math.floor((nowMs * visual.jitterFps) / 1000)
+      effJitterFps !== 8 && nowMs !== undefined
+        ? Math.floor((nowMs * effJitterFps) / 1000)
         : boilTick;
     const seed = this.seedBase + charBoilTick * 13.7;
     const rageLwMult = this.isEnraged ? 1.24 : 1;
     const rageRoughMult = this.isEnraged ? 1.5 : 1;
-    const lw = 2.8 * this.arenaScale * this.characterDef.lineWidth * rageLwMult;
+    const lw = 2.8 * this.arenaScale * this.getEffectiveLineWidthStat() * rageLwMult;
     const rough = 1.4 * visual.doubleStrokeRoughness * rageRoughMult;
     const strokePasses = visual.doublePasses;
 
@@ -7400,6 +9271,38 @@ export class StickFighter {
 
     if (visual.clownLook) {
       this.drawHeBongBayFigure(ctx, floorY, seed, charBoilTick, nowMs, inkColor, lw, rough, strokePasses);
+      if (hasSpin) {
+        ctx.restore();
+      }
+      return;
+    }
+
+    if (visual.ninjaLook) {
+      this.drawNinjaFigure(ctx, floorY, seed, charBoilTick, nowMs, inkColor, lw, rough, strokePasses);
+      if (hasSpin) {
+        ctx.restore();
+      }
+      return;
+    }
+
+    if (visual.wolfLook) {
+      this.drawNguoiSoiFigure(ctx, floorY, seed, charBoilTick, nowMs, inkColor, lw, rough, strokePasses);
+      if (hasSpin) {
+        ctx.restore();
+      }
+      return;
+    }
+
+    if (visual.pigRiderLook && !this.isSplitRider) {
+      this.drawKySiLonFigure(ctx, floorY, seed, charBoilTick, nowMs, inkColor, lw, rough, strokePasses);
+      if (hasSpin) {
+        ctx.restore();
+      }
+      return;
+    }
+
+    if (visual.pigLook) {
+      this.drawLonFigure(ctx, floorY, seed, charBoilTick, nowMs, inkColor, lw, rough, strokePasses);
       if (hasSpin) {
         ctx.restore();
       }
@@ -8204,22 +10107,27 @@ export class StickFighter {
         );
       }
     } else {
-      // Colored headband across forehead (Normal & Bự Con)
-      drawSketchLine(
-        ctx,
-        j.head.x - headR * 0.85,
-        j.head.y - headR * 0.35,
-        j.head.x + headR * 0.85,
-        j.head.y - headR * 0.35,
-        {
-          color: this.accentColor,
-          lineWidth: 3.1 * this.arenaScale * this.characterDef.lineWidth,
-          roughness: 0.8 * rageRoughMult,
-          seed: seed + 14,
-          passes: 2,
-          alpha: 0.9,
-        },
-      );
+      if (visual.brownHelmet) {
+        // Curved brown knight helmet over forehead/crown (split Kỵ Sĩ Lợn rider)
+        this.drawBrownKnightHelmet(ctx, j.head.x, j.head.y, headR, this.facing, s, seed, this.hasTriggeredHoldGround);
+      } else {
+        // Colored headband across forehead (Normal & Bự Con)
+        drawSketchLine(
+          ctx,
+          j.head.x - headR * 0.85,
+          j.head.y - headR * 0.35,
+          j.head.x + headR * 0.85,
+          j.head.y - headR * 0.35,
+          {
+            color: this.accentColor,
+            lineWidth: 3.1 * this.arenaScale * this.characterDef.lineWidth,
+            roughness: 0.8 * rageRoughMult,
+            seed: seed + 14,
+            passes: 2,
+            alpha: 0.9,
+          },
+        );
+      }
 
       // Bushy spiral scribble beard
       if (visual.beard) {
@@ -9918,6 +11826,1971 @@ export class StickFighter {
     }
 
     void charBoilTick;
+    void floorY;
+  }
+
+  private drawNinjaFigure(
+    ctx: CanvasRenderingContext2D,
+    floorY: number,
+    seed: number,
+    charBoilTick: number,
+    nowMs: number | undefined,
+    inkColor: string,
+    lw: number,
+    rough: number,
+    _strokePasses: number,
+  ) {
+    const j = this.joints;
+    const s = this.scale;
+    const f = this.facing;
+    const visual = this.characterDef.visual;
+    const isLowHp = this.hp > 0 && this.hp < this.maxHp * 0.3;
+    const isKO = this.action === 'KO';
+    const traitReady = this.escapeLeapCooldown <= 0;
+    const nearEdgeDist = (this.characterDef.trait.nearEdge ?? 60) * s;
+    const leftEdgeDist = this.x - this.arenaMinX;
+    const rightEdgeDist = this.arenaMaxX - this.x;
+    const isCorneredReady =
+      this.hp > 0 && traitReady && Math.min(leftEdgeDist, rightEdgeDist) < nearEdgeDist;
+
+    // KO bottom-to-top eraser sweep clipping + pencil X mark
+    const eraseFrac = isKO ? clamp((this.koEraseTimer - 0.35) / 1.15, 0, 1) : 0;
+    const eraseAlpha = isKO ? clamp(1 - eraseFrac * 0.92, 0.04, 1) : 1;
+    const minJointY = Math.min(
+      j.head.y - 16 * s,
+      j.shoulder.y - 10 * s,
+      j.handL.y,
+      j.handR.y,
+      j.footL.y,
+      j.footR.y,
+    );
+    const eraseLineY = lerp(floorY + 14 * s, minJointY - 12 * s, eraseFrac);
+
+    ctx.save();
+    if (isKO && eraseFrac > 0) {
+      ctx.beginPath();
+      ctx.rect(this.x - 160 * s, -400, 320 * s, eraseLineY + 400);
+      ctx.clip();
+    }
+
+    // Helper for crisp single HB pencil strokes (or gapped "tẩy lỗ chỗ" segments at <30% HP)
+    const drawNinjaSeg = (
+      x0: number,
+      y0: number,
+      x1: number,
+      y1: number,
+      segSeed: number,
+      alpha: number,
+      lwMult = 1,
+      col = inkColor,
+    ) => {
+      const a = alpha * eraseAlpha;
+      if (!isLowHp) {
+        drawSketchLine(ctx, x0, y0, x1, y1, {
+          color: col,
+          lineWidth: lw * lwMult,
+          roughness: rough,
+          seed: segSeed,
+          passes: 1,
+          alpha: a,
+        });
+        return;
+      }
+      // Broken patchy segments ("tẩy lỗ chỗ") at low HP
+      const gapT = 0.36 + (Math.abs(Math.sin(segSeed * 1.7)) * 0.18);
+      const gapEnd = Math.min(0.86, gapT + 0.22);
+      const ax = lerp(x0, x1, gapT);
+      const ay = lerp(y0, y1, gapT);
+      const bx = lerp(x0, x1, gapEnd);
+      const by = lerp(y0, y1, gapEnd);
+      drawSketchLine(ctx, x0, y0, ax, ay, {
+        color: col,
+        lineWidth: lw * lwMult,
+        roughness: rough * 1.1,
+        seed: segSeed,
+        passes: 1,
+        alpha: a * 0.92,
+      });
+      drawSketchLine(ctx, bx, by, x1, y1, {
+        color: col,
+        lineWidth: lw * lwMult,
+        roughness: rough * 1.1,
+        seed: segSeed + 9,
+        passes: 1,
+        alpha: a * 0.92,
+      });
+    };
+
+    // 1. Trailing black headband ribbons (3 tails normally, 2 torn tails at <30% HP)
+    const tailCount = isLowHp ? 2 : Math.max(1, visual.scarfTailLines);
+    const tailColor = '#0F172A';
+    const dashHorizontal = this.action === 'DASH' || this.action === 'LEAP_OVER';
+    for (let tIdx = 0; tIdx < tailCount; tIdx++) {
+      const fan = (tIdx - (tailCount - 1) * 0.5) * 4.0 * s;
+      const tailPts = this.scarfNodes.map((pt, idx) => ({
+        x: pt.x + (idx === 0 ? 0 : (dashHorizontal ? -f * 4 * idx * s : 0) + fan * 0.2 * idx),
+        y: pt.y + (idx === 0 ? 0 : fan * (idx * 0.72) - (dashHorizontal ? idx * 4.5 * s : 0)),
+      }));
+      drawSketchPolyline(ctx, tailPts, {
+        color: tailColor,
+        lineWidth: 2.0 * this.arenaScale * this.characterDef.lineWidth,
+        roughness: 0.45,
+        seed: seed + 50 + tIdx * 3.1,
+        passes: 1,
+        alpha: 0.92 * eraseAlpha,
+      });
+    }
+
+    // 2. Back leg & back arm
+    drawNinjaSeg(j.hip.x, j.hip.y, j.kneeR.x, j.kneeR.y, seed + 1, 0.78);
+    drawNinjaSeg(j.kneeR.x, j.kneeR.y, j.footR.x, j.footR.y, seed + 2, 0.78);
+    drawNinjaSeg(j.shoulder.x, j.shoulder.y, j.elbowR.x, j.elbowR.y, seed + 3, 0.78, 0.92);
+    drawNinjaSeg(j.elbowR.x, j.elbowR.y, j.handR.x, j.handR.y, seed + 4, 0.78, 0.92);
+
+    // Weapon held in handR
+    if (this.weapon) {
+      const vec = this.getWeaponVector();
+      const weaponDrawMult =
+        this.weapon === 'sword'
+          ? visual.swordDrawScale
+          : this.weapon === 'bat'
+            ? visual.batDrawScale
+            : this.weapon === 'spear'
+              ? visual.spearDrawScale
+              : this.weapon === 'hammer'
+                ? visual.hammerDrawScale
+                : 1;
+      drawHeldWeapon(
+        ctx,
+        this.weapon,
+        j.handR.x,
+        j.handR.y,
+        vec.dx,
+        vec.dy,
+        s * weaponDrawMult,
+        seed + 62,
+      );
+    }
+
+    // 3. Torso + diagonal black chest sash
+    drawNinjaSeg(j.hip.x, j.hip.y, j.shoulder.x, j.shoulder.y, seed + 5, 0.96, 1.08);
+    const sashTopX = j.shoulder.x - f * 2.2 * s;
+    const sashTopY = j.shoulder.y + 3 * s;
+    const sashBotX = j.hip.x + f * 3.2 * s;
+    const sashBotY = j.hip.y - 3 * s;
+    drawNinjaSeg(sashTopX, sashTopY, sashBotX, sashBotY, seed + 59, 0.94, 1.18, '#0F172A');
+
+    // Hunched shoulder tension lines when cornered with escapeLeap ready
+    if (isCorneredReady) {
+      drawSketchLine(
+        ctx,
+        j.shoulder.x - 5 * s,
+        j.shoulder.y - 3.5 * s,
+        j.shoulder.x + 5 * s,
+        j.shoulder.y - 3.5 * s,
+        {
+          color: '#7C3AED',
+          lineWidth: 1.5 * s,
+          roughness: 0.35,
+          seed: seed + 61,
+          passes: 1,
+          alpha: 0.82 * eraseAlpha,
+        },
+      );
+    }
+
+    // 4. Hip shuriken pouch indicator (ready purple star / cooling empty gray / 0.2s bottom-to-tip fill)
+    const pouchX = j.hip.x - f * 6.5 * s;
+    const pouchY = j.hip.y - 2.5 * s;
+    const pouchR = 3.8 * s;
+    drawSketchCircle(ctx, pouchX, pouchY, pouchR, {
+      color: traitReady ? '#0F172A' : '#64748B',
+      lineWidth: 1.35 * s,
+      roughness: 0.35,
+      seed: seed + 64,
+      passes: 1,
+      alpha: (traitReady ? 0.95 : 0.65) * eraseAlpha,
+    });
+    if (traitReady) {
+      const fillFrac =
+        this.escapeLeapReadyAnimTimer > 0
+          ? clamp(1 - this.escapeLeapReadyAnimTimer / 0.2, 0, 1)
+          : 1;
+      const starR = 5.6 * s;
+      ctx.save();
+      if (fillFrac < 1) {
+        const clipBottom = pouchY + starR;
+        const clipTop = lerp(pouchY + starR, pouchY - starR - 2 * s, fillFrac);
+        ctx.beginPath();
+        ctx.rect(pouchX - starR - 4 * s, clipTop, (starR + 4 * s) * 2, clipBottom - clipTop + 2 * s);
+        ctx.clip();
+      }
+      drawSketchLine(ctx, pouchX - starR, pouchY, pouchX + starR, pouchY, {
+        color: '#7C3AED',
+        lineWidth: 1.9 * s,
+        roughness: 0.25,
+        seed: seed + 65,
+        passes: 1,
+        alpha: 0.96 * eraseAlpha,
+      });
+      drawSketchLine(ctx, pouchX, pouchY - starR, pouchX, pouchY + starR, {
+        color: '#7C3AED',
+        lineWidth: 1.9 * s,
+        roughness: 0.25,
+        seed: seed + 66,
+        passes: 1,
+        alpha: 0.96 * eraseAlpha,
+      });
+      ctx.restore();
+    }
+
+    // 5. Front leg & front arm + fists
+    drawNinjaSeg(j.hip.x, j.hip.y, j.kneeL.x, j.kneeL.y, seed + 6, 0.96);
+    drawNinjaSeg(j.kneeL.x, j.kneeL.y, j.footL.x, j.footL.y, seed + 7, 0.96);
+    drawNinjaSeg(j.shoulder.x, j.shoulder.y, j.elbowL.x, j.elbowL.y, seed + 8, 0.96, 0.94);
+    drawNinjaSeg(j.elbowL.x, j.elbowL.y, j.handL.x, j.handL.y, seed + 9, 0.96, 0.94);
+
+    const fistR = 2.6 * this.arenaScale * visual.fistScale;
+    drawSketchCircle(ctx, j.handL.x, j.handL.y, fistR, {
+      color: inkColor,
+      lineWidth: lw * 0.72,
+      roughness: 0.45,
+      seed: seed + 10,
+      passes: 1,
+      alpha: 0.95 * eraseAlpha,
+    });
+    drawSketchCircle(ctx, j.handR.x, j.handR.y, fistR, {
+      color: inkColor,
+      lineWidth: lw * 0.72,
+      roughness: 0.45,
+      seed: seed + 11,
+      passes: 1,
+      alpha: 0.85 * eraseAlpha,
+    });
+
+    if (this.hasShield) {
+      drawHeldShield(
+        ctx,
+        j.handL.x,
+        j.handL.y,
+        f,
+        this.action === 'SHIELD_CROUCH',
+        s * visual.shieldDrawScale,
+        seed + 72,
+      );
+    }
+
+    // 6. Head + black headband + triangle mask + 6 eye expressions
+    const headR = 13.5 * s * visual.headScale;
+    if (isLowHp) {
+      // Broken patchy head circle at <30% HP
+      const segs = 6;
+      for (let i = 0; i < segs; i++) {
+        if (i === 1 || i === 4) continue;
+        const a0 = (i / segs) * Math.PI * 2;
+        const a1 = ((i + 0.85) / segs) * Math.PI * 2;
+        drawSketchLine(
+          ctx,
+          j.head.x + Math.cos(a0) * headR,
+          j.head.y + Math.sin(a0) * headR,
+          j.head.x + Math.cos(a1) * headR,
+          j.head.y + Math.sin(a1) * headR,
+          {
+            color: inkColor,
+            lineWidth: lw * 1.02,
+            roughness: rough,
+            seed: seed + 12 + i,
+            passes: 1,
+            alpha: 0.92 * eraseAlpha,
+          },
+        );
+      }
+    } else {
+      drawSketchCircle(ctx, j.head.x, j.head.y, headR, {
+        color: inkColor,
+        lineWidth: lw * 1.02,
+        roughness: rough,
+        seed: seed + 12,
+        passes: 1,
+        alpha: 0.95 * eraseAlpha,
+      });
+    }
+
+    // Black forehead headband strip
+    drawSketchLine(
+      ctx,
+      j.head.x - headR * 0.92,
+      j.head.y - headR * 0.36,
+      j.head.x + headR * 0.92,
+      j.head.y - headR * 0.36,
+      {
+        color: '#0F172A',
+        lineWidth: 2.8 * s,
+        roughness: 0.3,
+        seed: seed + 305,
+        passes: 1,
+        alpha: 0.96 * eraseAlpha,
+      },
+    );
+
+    // Triangle cloth mask over lower face
+    const trackShift = f * headR * 0.24;
+    const maskPts = [
+      { x: j.head.x - headR * 0.84, y: j.head.y + 0.4 * s },
+      { x: j.head.x + f * 1.8 * s, y: j.head.y + headR * 1.05 },
+      { x: j.head.x + headR * 0.88, y: j.head.y + 0.4 * s },
+      { x: j.head.x - headR * 0.84, y: j.head.y + 0.4 * s },
+    ];
+    ctx.save();
+    ctx.fillStyle = '#0F172A';
+    ctx.globalAlpha = 0.16 * eraseAlpha;
+    ctx.beginPath();
+    ctx.moveTo(maskPts[0].x, maskPts[0].y);
+    for (let mi = 1; mi < maskPts.length; mi++) ctx.lineTo(maskPts[mi].x, maskPts[mi].y);
+    ctx.closePath();
+    ctx.fill();
+    ctx.restore();
+    drawSketchPolyline(ctx, maskPts, {
+      color: '#0F172A',
+      lineWidth: 1.55 * s,
+      roughness: 0.3,
+      seed: seed + 308,
+      passes: 1,
+      alpha: 0.94 * eraseAlpha,
+    });
+
+    // Eye band expressions (6 states)
+    const eyeY = j.head.y - 1.6 * s;
+    const glanceDir = isCorneredReady ? (leftEdgeDist <= rightEdgeDist ? -1 : 1) : f;
+    const eyeCenter = j.head.x + (isCorneredReady ? glanceDir * headR * 0.22 : trackShift);
+    const eyeL = { x: eyeCenter - 3.8 * s, y: eyeY };
+    const eyeR = { x: eyeCenter + 3.8 * s, y: eyeY };
+    const leapProgress =
+      this.action === 'LEAP_OVER' && this.actionDuration > 0
+        ? clamp(this.actionTime / this.actionDuration, 0, 1)
+        : 0;
+
+    if (isKO) {
+      for (const [idx, ep] of [eyeL, eyeR].entries()) {
+        drawSketchLine(ctx, ep.x - 2 * s, ep.y - 2 * s, ep.x + 2 * s, ep.y + 2 * s, {
+          color: '#0F172A',
+          lineWidth: 1.45 * s,
+          roughness: 0.25,
+          seed: seed + 312 + idx * 2,
+          passes: 1,
+          alpha: eraseAlpha,
+        });
+        drawSketchLine(ctx, ep.x + 2 * s, ep.y - 2 * s, ep.x - 2 * s, ep.y + 2 * s, {
+          color: '#0F172A',
+          lineWidth: 1.45 * s,
+          roughness: 0.25,
+          seed: seed + 313 + idx * 2,
+          passes: 1,
+          alpha: eraseAlpha,
+        });
+      }
+    } else if (
+      this.action === 'HURT' ||
+      this.action === 'PINNED' ||
+      this.action === 'KNOCKDOWN' ||
+      this.action === 'SLIP'
+    ) {
+      // Downturned hurt curves
+      for (const [idx, ep] of [eyeL, eyeR].entries()) {
+        drawSketchPolyline(
+          ctx,
+          [
+            { x: ep.x - 2.2 * s, y: ep.y - 0.6 * s },
+            { x: ep.x, y: ep.y + 1.4 * s },
+            { x: ep.x + 2.2 * s, y: ep.y - 0.6 * s },
+          ],
+          {
+            color: '#0F172A',
+            lineWidth: 1.5 * s,
+            roughness: 0.25,
+            seed: seed + 318 + idx,
+            passes: 1,
+          },
+        );
+      }
+    } else if (this.action === 'LEAP_OVER' && leapProgress >= 0.82) {
+      // Squeezed > < eyes on landing recovery
+      drawSketchPolyline(
+        ctx,
+        [
+          { x: eyeL.x - 2 * s, y: eyeL.y - 1.8 * s },
+          { x: eyeL.x + 1.4 * s, y: eyeL.y },
+          { x: eyeL.x - 2 * s, y: eyeL.y + 1.8 * s },
+        ],
+        { color: '#0F172A', lineWidth: 1.45 * s, roughness: 0.25, seed: seed + 322, passes: 1 },
+      );
+      drawSketchPolyline(
+        ctx,
+        [
+          { x: eyeR.x + 2 * s, y: eyeR.y - 1.8 * s },
+          { x: eyeR.x - 1.4 * s, y: eyeR.y },
+          { x: eyeR.x + 2 * s, y: eyeR.y + 1.8 * s },
+        ],
+        { color: '#0F172A', lineWidth: 1.45 * s, roughness: 0.25, seed: seed + 323, passes: 1 },
+      );
+    } else if (this.action === 'LEAP_OVER') {
+      // Wide alert circles mid-leap
+      for (const [idx, ep] of [eyeL, eyeR].entries()) {
+        drawSketchCircle(ctx, ep.x, ep.y, 2.2 * s, {
+          color: '#0F172A',
+          lineWidth: 1.35 * s,
+          roughness: 0.25,
+          seed: seed + 325 + idx,
+          passes: 1,
+        });
+      }
+    } else if (isLowHp && !isCorneredReady) {
+      // Tired drooping half-lidded strokes
+      for (const [idx, ep] of [eyeL, eyeR].entries()) {
+        drawSketchLine(ctx, ep.x - 2.2 * s, ep.y + 0.5 * s, ep.x + 2.2 * s, ep.y + 0.9 * s, {
+          color: '#0F172A',
+          lineWidth: 1.4 * s,
+          roughness: 0.3,
+          seed: seed + 328 + idx,
+          passes: 1,
+        });
+      }
+    } else {
+      // Default slanted sharp eyes (or glancing toward edge if cornered & ready) + purple glint
+      const slant = isCorneredReady ? glanceDir : f;
+      drawSketchLine(
+        ctx,
+        eyeL.x - 2.2 * s,
+        eyeL.y - 0.8 * s * slant,
+        eyeL.x + 2.2 * s,
+        eyeL.y + 0.6 * s * slant,
+        {
+          color: '#0F172A',
+          lineWidth: 1.55 * s,
+          roughness: 0.2,
+          seed: seed + 332,
+          passes: 1,
+        },
+      );
+      drawSketchLine(
+        ctx,
+        eyeR.x - 2.2 * s,
+        eyeR.y + 0.6 * s * slant,
+        eyeR.x + 2.2 * s,
+        eyeR.y - 0.8 * s * slant,
+        {
+          color: '#0F172A',
+          lineWidth: 1.55 * s,
+          roughness: 0.2,
+          seed: seed + 333,
+          passes: 1,
+        },
+      );
+      if (traitReady) {
+        const glintEye = slant >= 0 ? eyeR : eyeL;
+        ctx.save();
+        ctx.fillStyle = '#9333EA';
+        ctx.beginPath();
+        ctx.arc(glintEye.x + slant * 0.8 * s, glintEye.y - 0.2 * s, 1.5 * s, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.restore();
+      }
+    }
+
+    // Block / Shield Crouch arc
+    if (this.action === 'BLOCK' || this.action === 'SHIELD_CROUCH') {
+      const isShieldCrouch = this.action === 'SHIELD_CROUCH';
+      const bx = j.handL.x + f * (isShieldCrouch ? 16 : 8) * s;
+      const by = isShieldCrouch ? j.handL.y - 2 * s : (j.handL.y + j.handR.y) * 0.5;
+      const arcHalf = (isShieldCrouch ? 22 : 16) * s;
+      const arcColor = isShieldCrouch ? '#7C3AED' : '#475569';
+      drawSketchLine(ctx, bx, by - arcHalf, bx + f * 5 * s, by, {
+        color: arcColor,
+        lineWidth: (isShieldCrouch ? 2.2 : 1.8) * s,
+        roughness: 0.8,
+        seed: seed + 25,
+        passes: 1,
+        alpha: 0.84,
+      });
+      drawSketchLine(ctx, bx + f * 5 * s, by, bx, by + arcHalf, {
+        color: arcColor,
+        lineWidth: (isShieldCrouch ? 2.2 : 1.8) * s,
+        roughness: 0.8,
+        seed: seed + 26,
+        passes: 1,
+        alpha: 0.84,
+      });
+    }
+
+    if (this.action === 'NOTICE') {
+      ctx.save();
+      ctx.font = `bold ${Math.round(24 * s)}px "Patrick Hand", cursive, sans-serif`;
+      ctx.fillStyle = this.accentColor;
+      ctx.textAlign = 'center';
+      ctx.fillText('!', j.head.x, j.head.y - 24 * s);
+      ctx.restore();
+    }
+
+    if (this.hasTempStatus('creamPie')) {
+      this.drawCreamPieSmear(ctx, j, s, seed);
+    }
+
+    if (
+      this.action === 'DASH' ||
+      this.action === 'SLIDE' ||
+      this.action === 'BACKSTEP' ||
+      this.action === 'LEAP_OVER'
+    ) {
+      const streakDir = this.action === 'BACKSTEP' ? -f : f;
+      for (let i = 0; i < 3; i++) {
+        const ly = j.shoulder.y + i * 10 * s;
+        const lx = j.shoulder.x - streakDir * (12 + i * 5) * s;
+        drawSketchLine(ctx, lx, ly, lx - streakDir * 19 * s, ly, {
+          color: this.action === 'LEAP_OVER' ? '#7C3AED' : '#0F172A',
+          lineWidth: 1.4 * s,
+          roughness: 0.6,
+          seed: seed + 40 + i,
+          passes: 1,
+          alpha: 0.58,
+        });
+      }
+    }
+
+    ctx.restore();
+
+    // KO pencil X cross-out drawn over fallen body while fading/erasing
+    if (isKO) {
+      const cx = (j.hip.x + j.head.x) * 0.5;
+      const cy = (j.hip.y + j.head.y) * 0.5 - 4 * s;
+      const rx = 24 * s;
+      const ry = 14 * s;
+      const crossAlpha = clamp(1 - eraseFrac * 0.78, 0.14, 0.88);
+      drawSketchLine(ctx, cx - rx, cy - ry, cx + rx, cy + ry, {
+        color: '#0F172A',
+        lineWidth: 2.1 * s,
+        roughness: 0.55,
+        seed: seed + 360,
+        passes: 1,
+        alpha: crossAlpha,
+      });
+      drawSketchLine(ctx, cx + rx, cy - ry, cx - rx, cy + ry, {
+        color: '#0F172A',
+        lineWidth: 2.1 * s,
+        roughness: 0.55,
+        seed: seed + 361,
+        passes: 1,
+        alpha: crossAlpha,
+      });
+    }
+
+    void charBoilTick;
+    void nowMs;
+  }
+
+  private drawBrownKnightHelmet(
+    ctx: CanvasRenderingContext2D,
+    hx: number,
+    hy: number,
+    headR: number,
+    f: 1 | -1,
+    s: number,
+    seed: number,
+    dented: boolean,
+  ) {
+    const helmCol = '#92400E';
+    ctx.save();
+    ctx.fillStyle = helmCol;
+    ctx.globalAlpha = 0.25;
+    ctx.beginPath();
+    ctx.arc(hx, hy - headR * 0.14, headR * 1.12, Math.PI, 0);
+    ctx.closePath();
+    ctx.fill();
+    ctx.restore();
+
+    const domePts: Array<{ x: number; y: number }> = [];
+    for (let i = 0; i <= 6; i++) {
+      const a = Math.PI + (Math.PI * i) / 6;
+      domePts.push({
+        x: hx + Math.cos(a) * headR * 1.12,
+        y: hy - headR * 0.14 + Math.sin(a) * headR * 1.05,
+      });
+    }
+    drawSketchPolyline(ctx, domePts, {
+      color: helmCol,
+      lineWidth: 2.3 * s,
+      roughness: 0.45,
+      seed: seed + 401,
+      passes: 2,
+    });
+    // Helmet brim / brow guard
+    drawSketchLine(
+      ctx,
+      hx - headR * 1.16,
+      hy - headR * 0.16,
+      hx + headR * 1.24 * (f > 0 ? 1 : 0.95),
+      hy - headR * 0.24,
+      {
+        color: helmCol,
+        lineWidth: 2.6 * s,
+        roughness: 0.5,
+        seed: seed + 405,
+        passes: 2,
+      },
+    );
+    // Small top crest nub
+    drawSketchLine(
+      ctx,
+      hx - f * 2 * s,
+      hy - headR * 1.18,
+      hx - f * 7 * s,
+      hy - headR * 1.48,
+      {
+        color: helmCol,
+        lineWidth: 2.1 * s,
+        roughness: 0.5,
+        seed: seed + 408,
+        passes: 1,
+      },
+    );
+    // Cracked dent line when hold-ground (<30% HP) has triggered
+    if (dented) {
+      drawSketchPolyline(
+        ctx,
+        [
+          { x: hx + f * headR * 0.15, y: hy - headR * 0.95 },
+          { x: hx - f * headR * 0.1, y: hy - headR * 0.58 },
+          { x: hx + f * headR * 0.18, y: hy - headR * 0.3 },
+        ],
+        {
+          color: '#451A03',
+          lineWidth: 1.8 * s,
+          roughness: 0.35,
+          seed: seed + 412,
+          passes: 1,
+        },
+      );
+    }
+  }
+
+  private drawPigGeometry(
+    ctx: CanvasRenderingContext2D,
+    cx: number,
+    groundY: number,
+    s: number,
+    f: 1 | -1,
+    seed: number,
+    lw: number,
+    rough: number,
+    opts: {
+      isMoving: boolean;
+      stridePhase: number;
+      isCharging: boolean;
+      isStomp: boolean;
+      stompProg: number;
+      isNudge: boolean;
+      isHurt: boolean;
+      isDown: boolean;
+      isKO: boolean;
+      hasSaddle: boolean;
+    },
+  ): { snoutX: number; snoutY: number; backTopY: number } {
+    const pinkStroke = '#1E293B';
+    const pigPink = '#F472B6';
+    const hoofColor = '#451A03';
+    const bodyRx = 27 * s;
+    const bodyRy = 16.5 * s;
+
+    const stompLift = opts.isStomp
+      ? Math.sin(clamp(opts.stompProg / 0.55, 0, 1) * Math.PI) * 14 * s
+      : 0;
+    const chargeDrop = opts.isCharging ? 4.5 * s : 0;
+    const nudgeTilt = opts.isNudge ? f * 0.14 : 0;
+    const bodyCenterY = groundY - (opts.isDown || opts.isKO ? 17 * s : 24 * s) + chargeDrop - stompLift * 0.45;
+    const tiltAngle = opts.isKO
+      ? Math.PI
+      : opts.isDown
+        ? -f * 0.85
+        : opts.isCharging
+          ? f * 0.18
+          : opts.isStomp
+            ? -f * (opts.stompProg < 0.45 ? 0.28 : -0.1)
+            : nudgeTilt;
+
+    ctx.save();
+    ctx.translate(cx, bodyCenterY);
+    ctx.rotate(tiltAngle);
+
+    // 4 animated pig legs + dark hooves (#451A03)
+    const legOffsets = [-16 * s, -7 * s, 9 * s, 17 * s];
+    for (let li = 0; li < legOffsets.length; li++) {
+      const lx = legOffsets[li];
+      const phase = opts.stridePhase + (li % 2 === 0 ? 0 : Math.PI) + (li >= 2 ? 0.6 : 0);
+      const swingX = opts.isMoving && !opts.isDown && !opts.isKO ? Math.sin(phase) * 7.5 * s : 0;
+      const liftY =
+        opts.isStomp && li >= 2
+          ? -stompLift * 0.85
+          : opts.isMoving && !opts.isDown && !opts.isKO
+            ? -Math.max(0, Math.cos(phase)) * 4.5 * s
+            : 0;
+      const hipLegY = bodyRy * 0.62;
+      const footX = lx + swingX + (opts.isCharging ? -f * 4 * s : 0);
+      const footY = 23 * s + liftY - (opts.isCharging ? 3 * s : 0);
+      drawSketchLine(ctx, lx, hipLegY, footX, footY, {
+        color: pinkStroke,
+        lineWidth: lw * (li === 0 || li === 2 ? 0.85 : 1.0),
+        roughness: rough * 0.7,
+        seed: seed + 420 + li,
+        passes: 1,
+        alpha: li === 0 || li === 2 ? 0.75 : 0.95,
+      });
+      // Dark hoof nub
+      ctx.save();
+      ctx.fillStyle = hoofColor;
+      ctx.beginPath();
+      ctx.arc(footX + f * 1.2 * s, footY, 2.7 * s, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
+    }
+
+    // Plump oval pig body
+    ctx.save();
+    ctx.fillStyle = pigPink;
+    ctx.globalAlpha = 0.22;
+    ctx.beginPath();
+    ctx.ellipse(0, 0, bodyRx, bodyRy, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+
+    const ovalPts: Array<{ x: number; y: number }> = [];
+    for (let i = 0; i <= 14; i++) {
+      const a = (i / 14) * Math.PI * 2;
+      ovalPts.push({ x: Math.cos(a) * bodyRx, y: Math.sin(a) * bodyRy });
+    }
+    drawSketchPolyline(ctx, ovalPts, {
+      color: pinkStroke,
+      lineWidth: lw * 1.05,
+      roughness: rough * 0.8,
+      seed: seed + 430,
+      passes: 2,
+    });
+
+    // Saddle strap if rider is mounted
+    if (opts.hasSaddle) {
+      ctx.save();
+      ctx.fillStyle = '#92400E';
+      ctx.globalAlpha = 0.34;
+      ctx.fillRect(-9 * s, -bodyRy * 0.95, 18 * s, 11 * s);
+      ctx.restore();
+      drawSketchLine(ctx, -9 * s, -bodyRy * 0.92, -9 * s, 3 * s, {
+        color: '#92400E',
+        lineWidth: 2.0 * s,
+        roughness: 0.45,
+        seed: seed + 435,
+        passes: 1,
+      });
+      drawSketchLine(ctx, 9 * s, -bodyRy * 0.92, 9 * s, 3 * s, {
+        color: '#92400E',
+        lineWidth: 2.0 * s,
+        roughness: 0.45,
+        seed: seed + 436,
+        passes: 1,
+      });
+    }
+
+    // Curly spiral tail at back
+    const tailDir = -f;
+    const tailX = tailDir * (bodyRx - 1 * s);
+    const tailY = -4 * s;
+    drawSketchPolyline(
+      ctx,
+      [
+        { x: tailX, y: tailY },
+        { x: tailX + tailDir * 6 * s, y: tailY - 5 * s },
+        { x: tailX + tailDir * 9 * s, y: tailY - 1 * s },
+        { x: tailX + tailDir * 5 * s, y: tailY + 2 * s },
+        { x: tailX + tailDir * 11 * s, y: tailY - 4 * s },
+      ],
+      {
+        color: pigPink,
+        lineWidth: 2.0 * s,
+        roughness: 0.5,
+        seed: seed + 440,
+        passes: 1,
+      },
+    );
+
+    // Floppy pig ear
+    const earBaseX = f * (bodyRx * 0.52);
+    const earBaseY = -bodyRy * 0.72;
+    drawSketchPolyline(
+      ctx,
+      [
+        { x: earBaseX, y: earBaseY },
+        { x: earBaseX - f * 6 * s, y: earBaseY - 9 * s },
+        { x: earBaseX - f * 10 * s, y: earBaseY - 1 * s },
+        { x: earBaseX, y: earBaseY + 2 * s },
+      ],
+      {
+        color: pinkStroke,
+        lineWidth: 1.8 * s,
+        roughness: 0.5,
+        seed: seed + 444,
+        passes: 1,
+      },
+    );
+
+    // Snout at front
+    const snoutLocalX = f * (bodyRx + 4.5 * s);
+    const snoutLocalY = 1.5 * s;
+    ctx.save();
+    ctx.fillStyle = pigPink;
+    ctx.globalAlpha = 0.42;
+    ctx.beginPath();
+    ctx.ellipse(snoutLocalX, snoutLocalY, 5.2 * s, 6.8 * s, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+    drawSketchCircle(ctx, snoutLocalX, snoutLocalY, 5.6 * s, {
+      color: pinkStroke,
+      lineWidth: 1.8 * s,
+      roughness: 0.45,
+      seed: seed + 448,
+      passes: 1,
+    });
+    // 2 nostril dots
+    ctx.save();
+    ctx.fillStyle = hoofColor;
+    ctx.beginPath();
+    ctx.arc(snoutLocalX + f * 1.2 * s, snoutLocalY - 1.8 * s, 1.15 * s, 0, Math.PI * 2);
+    ctx.arc(snoutLocalX + f * 1.2 * s, snoutLocalY + 1.8 * s, 1.15 * s, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+
+    // Hurt little pink tongue sticking out!
+    if (opts.isHurt) {
+      drawSketchPolyline(
+        ctx,
+        [
+          { x: f * (bodyRx * 0.85), y: 7 * s },
+          { x: f * (bodyRx + 3 * s), y: 12.5 * s },
+          { x: f * (bodyRx * 0.72), y: 11 * s },
+        ],
+        {
+          color: '#EC4899',
+          lineWidth: 1.9 * s,
+          roughness: 0.35,
+          seed: seed + 452,
+          passes: 1,
+        },
+      );
+    }
+
+    // Pig eye
+    const eyeX = f * (bodyRx * 0.72);
+    const eyeY = -4.5 * s;
+    if (opts.isKO) {
+      drawSketchLine(ctx, eyeX - 2.4 * s, eyeY - 2.4 * s, eyeX + 2.4 * s, eyeY + 2.4 * s, {
+        color: pinkStroke,
+        lineWidth: 1.7 * s,
+        roughness: 0.3,
+        seed: seed + 455,
+        passes: 1,
+      });
+      drawSketchLine(ctx, eyeX + 2.4 * s, eyeY - 2.4 * s, eyeX - 2.4 * s, eyeY + 2.4 * s, {
+        color: pinkStroke,
+        lineWidth: 1.7 * s,
+        roughness: 0.3,
+        seed: seed + 456,
+        passes: 1,
+      });
+    } else if (opts.isHurt || opts.isDown) {
+      drawSketchPolyline(
+        ctx,
+        [
+          { x: eyeX - f * 2.2 * s, y: eyeY - 2.2 * s },
+          { x: eyeX + f * 1.6 * s, y: eyeY },
+          { x: eyeX - f * 2.2 * s, y: eyeY + 2.2 * s },
+        ],
+        {
+          color: pinkStroke,
+          lineWidth: 1.6 * s,
+          roughness: 0.3,
+          seed: seed + 457,
+          passes: 1,
+        },
+      );
+    } else {
+      ctx.save();
+      ctx.fillStyle = pinkStroke;
+      ctx.beginPath();
+      ctx.arc(eyeX, eyeY, opts.isCharging ? 2.4 * s : 2.0 * s, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
+      if (opts.isCharging) {
+        // Fierce charging brow
+        drawSketchLine(ctx, eyeX - f * 4 * s, eyeY - 4 * s, eyeX + f * 3 * s, eyeY - 1.8 * s, {
+          color: pinkStroke,
+          lineWidth: 1.8 * s,
+          roughness: 0.35,
+          seed: seed + 458,
+          passes: 1,
+        });
+      }
+    }
+
+    ctx.restore();
+
+    const worldSnoutX = cx + Math.cos(tiltAngle) * snoutLocalX - Math.sin(tiltAngle) * snoutLocalY;
+    const worldSnoutY = bodyCenterY + Math.sin(tiltAngle) * snoutLocalX + Math.cos(tiltAngle) * snoutLocalY;
+    return {
+      snoutX: worldSnoutX,
+      snoutY: worldSnoutY,
+      backTopY: bodyCenterY - bodyRy,
+    };
+  }
+
+  private drawKySiLonFigure(
+    ctx: CanvasRenderingContext2D,
+    floorY: number,
+    seed: number,
+    _charBoilTick: number,
+    nowMs: number | undefined,
+    inkColor: string,
+    lw: number,
+    rough: number,
+    strokePasses: number,
+  ) {
+    const j = this.joints;
+    const s = this.scale;
+    const f = this.facing;
+    const visual = this.characterDef.visual;
+    const nowSec = (nowMs ?? performance.now()) / 1000;
+    const isKO = this.action === 'KO';
+    const isDown = this.action === 'KNOCKDOWN' || this.action === 'SLIP' || this.action === 'PINNED';
+    const isMoving = Math.abs(this.vx) > 20 * s || this.action === 'DASH' || this.action === 'SLIDE';
+
+    // 1. Back rider leg (behind pig saddle)
+    drawSketchLine(ctx, j.hip.x, j.hip.y, j.kneeR.x, j.kneeR.y, {
+      color: inkColor,
+      lineWidth: lw * 0.9,
+      roughness: rough,
+      seed: seed + 1,
+      passes: strokePasses,
+      alpha: 0.72,
+    });
+    drawSketchLine(ctx, j.kneeR.x, j.kneeR.y, j.footR.x, j.footR.y, {
+      color: inkColor,
+      lineWidth: lw * 0.9,
+      roughness: rough,
+      seed: seed + 2,
+      passes: strokePasses,
+      alpha: 0.72,
+    });
+
+    // 2. The plump war pig beneath the rider
+    const pigInfo = this.drawPigGeometry(
+      ctx,
+      this.x,
+      this.y,
+      s * 1.05,
+      f,
+      seed,
+      lw,
+      rough,
+      {
+        isMoving,
+        stridePhase: nowSec * (this.action === 'SLIDE' ? 22 : 14),
+        isCharging: this.action === 'SLIDE',
+        isStomp: false,
+        stompProg: 0,
+        isNudge: this.action === 'JAB',
+        isHurt: this.action === 'HURT',
+        isDown,
+        isKO,
+        hasSaddle: true,
+      },
+    );
+
+    // 3. Back arm + weapon held in handR
+    drawSketchLine(ctx, j.shoulder.x, j.shoulder.y, j.elbowR.x, j.elbowR.y, {
+      color: inkColor,
+      lineWidth: lw * 0.88,
+      roughness: rough,
+      seed: seed + 3,
+      passes: strokePasses,
+      alpha: 0.85,
+    });
+    drawSketchLine(ctx, j.elbowR.x, j.elbowR.y, j.handR.x, j.handR.y, {
+      color: inkColor,
+      lineWidth: lw * 0.88,
+      roughness: rough,
+      seed: seed + 4,
+      passes: strokePasses,
+      alpha: 0.85,
+    });
+
+    if (this.weapon) {
+      const vec = this.getWeaponVector();
+      const weaponDrawMult =
+        this.weapon === 'sword'
+          ? visual.swordDrawScale
+          : this.weapon === 'bat'
+            ? visual.batDrawScale
+            : this.weapon === 'spear'
+              ? visual.spearDrawScale
+              : this.weapon === 'hammer'
+                ? visual.hammerDrawScale
+                : 1;
+      drawHeldWeapon(
+        ctx,
+        this.weapon,
+        j.handR.x,
+        j.handR.y,
+        vec.dx,
+        vec.dy,
+        s * weaponDrawMult,
+        seed + 62,
+      );
+    }
+
+    // 4. Rider torso + front leg gripping saddle + front arm
+    drawSketchLine(ctx, j.hip.x, j.hip.y, j.shoulder.x, j.shoulder.y, {
+      color: inkColor,
+      lineWidth: lw * 1.05,
+      roughness: rough,
+      seed: seed + 5,
+      passes: strokePasses,
+      alpha: 0.96,
+    });
+    drawSketchLine(ctx, j.hip.x, j.hip.y, j.kneeL.x, j.kneeL.y, {
+      color: inkColor,
+      lineWidth: lw,
+      roughness: rough,
+      seed: seed + 6,
+      passes: strokePasses,
+      alpha: 0.96,
+    });
+    drawSketchLine(ctx, j.kneeL.x, j.kneeL.y, j.footL.x, j.footL.y, {
+      color: inkColor,
+      lineWidth: lw,
+      roughness: rough,
+      seed: seed + 7,
+      passes: strokePasses,
+      alpha: 0.96,
+    });
+    drawSketchLine(ctx, j.shoulder.x, j.shoulder.y, j.elbowL.x, j.elbowL.y, {
+      color: inkColor,
+      lineWidth: lw * 0.94,
+      roughness: rough,
+      seed: seed + 8,
+      passes: strokePasses,
+      alpha: 0.96,
+    });
+    drawSketchLine(ctx, j.elbowL.x, j.elbowL.y, j.handL.x, j.handL.y, {
+      color: inkColor,
+      lineWidth: lw * 0.94,
+      roughness: rough,
+      seed: seed + 9,
+      passes: strokePasses,
+      alpha: 0.96,
+    });
+
+    // Leather reins connecting rider handL to pig snout (taut brown >40% HP, frayed/cracked red <=40% HP)
+    const reinsStrained = this.hp <= this.maxHp * 0.4;
+    const midReinX = (j.handL.x + pigInfo.snoutX) * 0.5;
+    const midReinY = (j.handL.y + pigInfo.snoutY) * 0.5 + (reinsStrained ? 0 : 4.5 * s);
+    drawSketchPolyline(
+      ctx,
+      [
+        { x: j.handL.x, y: j.handL.y },
+        { x: midReinX, y: midReinY },
+        { x: pigInfo.snoutX, y: pigInfo.snoutY - 2 * s },
+      ],
+      {
+        color: reinsStrained ? '#DC2626' : '#92400E',
+        lineWidth: (reinsStrained ? 1.5 : 1.9) * s,
+        roughness: reinsStrained ? 1.4 : 0.45,
+        seed: seed + 470,
+        passes: 1,
+        alpha: reinsStrained ? 0.9 : 0.88,
+      },
+    );
+    if (reinsStrained) {
+      // Jagged tension sparks/cracks on reins
+      drawSketchLine(ctx, midReinX - 4 * s, midReinY - 4 * s, midReinX + 4 * s, midReinY + 4 * s, {
+        color: '#DC2626',
+        lineWidth: 1.5 * s,
+        roughness: 0.6,
+        seed: seed + 472,
+        passes: 1,
+      });
+    }
+
+    if (this.hasShield) {
+      drawHeldShield(
+        ctx,
+        j.handL.x,
+        j.handL.y,
+        f,
+        this.action === 'SHIELD_CROUCH',
+        s * visual.shieldDrawScale,
+        seed + 72,
+      );
+    }
+
+    // 5. Rider head + brown knight helmet + determined eyes
+    const headR = 12.2 * s * visual.headScale;
+    ctx.save();
+    ctx.fillStyle = '#FDF8EB';
+    ctx.globalAlpha = 0.86;
+    ctx.beginPath();
+    ctx.arc(j.head.x, j.head.y, headR, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+    drawSketchCircle(ctx, j.head.x, j.head.y, headR, {
+      color: inkColor,
+      lineWidth: lw,
+      roughness: rough,
+      seed: seed + 12,
+      passes: strokePasses,
+    });
+    this.drawBrownKnightHelmet(ctx, j.head.x, j.head.y, headR, f, s, seed, this.hasTriggeredHoldGround);
+
+    const eyeX = j.head.x + f * 4.2 * s;
+    const eyeY = j.head.y + 1.0 * s;
+    if (isKO) {
+      drawSketchLine(ctx, eyeX - 2.6 * s, eyeY - 2.6 * s, eyeX + 2.6 * s, eyeY + 2.6 * s, {
+        color: inkColor,
+        lineWidth: 1.5 * s,
+        roughness: 0.4,
+        seed: seed + 15,
+        passes: 1,
+      });
+      drawSketchLine(ctx, eyeX + 2.6 * s, eyeY - 2.6 * s, eyeX - 2.6 * s, eyeY + 2.6 * s, {
+        color: inkColor,
+        lineWidth: 1.5 * s,
+        roughness: 0.4,
+        seed: seed + 16,
+        passes: 1,
+      });
+    } else {
+      drawSketchLine(ctx, eyeX - 3.2 * s * f, eyeY - 3.2 * s, eyeX + 3.2 * s * f, eyeY - 1.2 * s, {
+        color: inkColor,
+        lineWidth: 1.6 * s,
+        roughness: 0.35,
+        seed: seed + 17,
+        passes: 1,
+      });
+      ctx.save();
+      ctx.fillStyle = inkColor;
+      ctx.beginPath();
+      ctx.arc(eyeX, eyeY + 1.0 * s, 1.7 * s, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
+    }
+
+    if (this.action === 'BLOCK' || this.action === 'SHIELD_CROUCH') {
+      const isShieldCrouch = this.action === 'SHIELD_CROUCH';
+      const bx = j.handL.x + f * (isShieldCrouch ? 16 : 8) * s;
+      const by = isShieldCrouch ? j.handL.y - 2 * s : (j.handL.y + j.handR.y) * 0.5;
+      const arcHalf = (isShieldCrouch ? 22 : 16) * s;
+      const arcColor = isShieldCrouch ? '#1E3A8A' : '#475569';
+      drawSketchLine(ctx, bx, by - arcHalf, bx + f * 5 * s, by, {
+        color: arcColor,
+        lineWidth: 2.1 * s,
+        roughness: 1.0,
+        seed: seed + 25,
+        passes: 2,
+        alpha: 0.84,
+      });
+      drawSketchLine(ctx, bx + f * 5 * s, by, bx, by + arcHalf, {
+        color: arcColor,
+        lineWidth: 2.1 * s,
+        roughness: 1.0,
+        seed: seed + 26,
+        passes: 2,
+        alpha: 0.84,
+      });
+    }
+
+    if (this.action === 'NOTICE') {
+      ctx.save();
+      ctx.font = `bold ${Math.round(24 * s)}px "Patrick Hand", cursive, sans-serif`;
+      ctx.fillStyle = this.accentColor;
+      ctx.textAlign = 'center';
+      ctx.fillText('!', j.head.x, j.head.y - 24 * s);
+      ctx.restore();
+    }
+
+    if (this.hasTempStatus('creamPie')) {
+      this.drawCreamPieSmear(ctx, j, s, seed);
+    }
+
+    if (this.action === 'SLIDE' || this.action === 'DASH') {
+      for (let i = 0; i < 3; i++) {
+        const ly = pigInfo.backTopY + i * 10 * s;
+        const lx = this.x - f * (24 + i * 6) * s;
+        drawSketchLine(ctx, lx, ly, lx - f * 22 * s, ly, {
+          color: '#D97706',
+          lineWidth: 1.8 * s,
+          roughness: 0.7,
+          seed: seed + 480 + i,
+          passes: 1,
+          alpha: 0.68,
+        });
+      }
+    }
+
+    void floorY;
+  }
+
+  private drawLonFigure(
+    ctx: CanvasRenderingContext2D,
+    floorY: number,
+    seed: number,
+    _charBoilTick: number,
+    nowMs: number | undefined,
+    _inkColor: string,
+    lw: number,
+    rough: number,
+    _strokePasses: number,
+  ) {
+    const j = this.joints;
+    const s = this.scale;
+    const f = this.facing;
+    const nowSec = (nowMs ?? performance.now()) / 1000;
+    const isKO = this.action === 'KO';
+    const isDown = this.action === 'KNOCKDOWN' || this.action === 'SLIP' || this.action === 'PINNED';
+    const isStomp = this.action === 'SWEEP_KICK';
+    const stompProg = isStomp && this.actionDuration > 0 ? clamp(this.actionTime / this.actionDuration, 0, 1) : 0;
+    const isMoving = Math.abs(this.vx) > 20 * s || this.action === 'DASH' || this.action === 'SLIDE';
+
+    const pigInfo = this.drawPigGeometry(
+      ctx,
+      this.x,
+      this.y,
+      s,
+      f,
+      seed,
+      lw,
+      rough,
+      {
+        isMoving,
+        stridePhase: nowSec * (this.action === 'SLIDE' ? 24 : 16),
+        isCharging: this.action === 'SLIDE',
+        isStomp,
+        stompProg,
+        isNudge: this.action === 'JAB',
+        isHurt: this.action === 'HURT',
+        isDown,
+        isKO,
+        hasSaddle: false,
+      },
+    );
+
+    if (this.action === 'SLIDE') {
+      for (let i = 0; i < 3; i++) {
+        const ly = pigInfo.backTopY + i * 8 * s;
+        const lx = this.x - f * (22 + i * 6) * s;
+        drawSketchLine(ctx, lx, ly, lx - f * 20 * s, ly, {
+          color: '#EA580C',
+          lineWidth: 1.7 * s,
+          roughness: 0.7,
+          seed: seed + 490 + i,
+          passes: 1,
+          alpha: 0.72,
+        });
+      }
+    }
+
+    if (isStomp && stompProg >= 0.42 && stompProg <= 0.72) {
+      // Stomp impact shock arc under hooves
+      drawSketchLine(ctx, this.x - 22 * s, floorY - 2 * s, this.x + 22 * s, floorY - 2 * s, {
+        color: '#92400E',
+        lineWidth: 2.2 * s,
+        roughness: 1.1,
+        seed: seed + 495,
+        passes: 1,
+        alpha: 0.8,
+      });
+    }
+
+    if (this.hasTempStatus('creamPie')) {
+      this.drawCreamPieSmear(ctx, j, s, seed);
+    }
+
+    // Pencil X mark when pig is KO'd
+    if (isKO) {
+      const cx = this.x;
+      const cy = this.y - 16 * s;
+      drawSketchLine(ctx, cx - 22 * s, cy - 12 * s, cx + 22 * s, cy + 12 * s, {
+        color: '#1E293B',
+        lineWidth: 2.0 * s,
+        roughness: 0.5,
+        seed: seed + 497,
+        passes: 1,
+        alpha: 0.78,
+      });
+      drawSketchLine(ctx, cx + 22 * s, cy - 12 * s, cx - 22 * s, cy + 12 * s, {
+        color: '#1E293B',
+        lineWidth: 2.0 * s,
+        roughness: 0.5,
+        seed: seed + 498,
+        passes: 1,
+        alpha: 0.78,
+      });
+    }
+  }
+
+  private drawNguoiSoiFigure(
+    ctx: CanvasRenderingContext2D,
+    floorY: number,
+    seed: number,
+    _charBoilTick: number,
+    nowMs: number | undefined,
+    inkColor: string,
+    lw: number,
+    rough: number,
+    strokePasses: number,
+  ) {
+    const j = this.joints;
+    const s = this.scale;
+    const f = this.facing;
+    const visual = this.characterDef.visual;
+    const nowSec = (nowMs ?? performance.now()) / 1000;
+    const isKO = this.action === 'KO';
+    const isHurt =
+      this.action === 'HURT' ||
+      this.action === 'PINNED' ||
+      this.action === 'KNOCKDOWN' ||
+      this.action === 'SLIP';
+    const isLowHp = this.hp > 0 && this.hp <= this.maxHp * 0.3;
+    const morphP =
+      this.isTransformingWolf && this.action === 'TAUNT' && this.actionDuration > 0
+        ? clamp(this.actionTime / this.actionDuration, 0, 1)
+        : this.isWolfForm
+          ? 1
+          : 0;
+    const isWolfVisual = this.isWolfForm || (this.isTransformingWolf && morphP >= 0.45);
+    const maxGauge = this.characterDef.trait.moonForm?.maxGauge ?? 80;
+    const gaugeRatio = clamp(this.moonGauge / Math.max(1, maxGauge), 0, 1);
+
+    const drawSeg = (
+      x0: number,
+      y0: number,
+      x1: number,
+      y1: number,
+      segSeed: number,
+      alpha = 1,
+      lwMult = 1,
+      col = inkColor,
+    ) => {
+      drawSketchLine(ctx, x0, y0, x1, y1, {
+        color: col,
+        lineWidth: lw * lwMult,
+        roughness: rough * (isWolfVisual ? 1.15 : 1),
+        seed: segSeed,
+        passes: isWolfVisual ? 2 : strokePasses,
+        alpha,
+      });
+    };
+
+    // 1. Tail behind hip (compact bushy tail in human form -> huge zigzag bushy wolf tail in wolf form)
+    if (!isKO) {
+      const tailWag = Math.sin(nowSec * (isWolfVisual ? 10 : 5) + this.seedBase) * (isWolfVisual ? 5.5 : 2.5) * s;
+      const tailLen = lerp(19, 34, morphP) * s;
+      const tailPts = isWolfVisual
+        ? [
+            { x: j.hip.x - f * 2 * s, y: j.hip.y - 2 * s },
+            { x: j.hip.x - f * (tailLen * 0.42), y: j.hip.y - 8 * s + tailWag * 0.4 },
+            { x: j.hip.x - f * (tailLen * 0.78), y: j.hip.y - 18 * s + tailWag },
+            { x: j.hip.x - f * tailLen, y: j.hip.y - 11 * s + tailWag },
+            { x: j.hip.x - f * (tailLen * 0.65), y: j.hip.y - 4 * s + tailWag * 0.6 },
+            { x: j.hip.x - f * (tailLen * 0.85), y: j.hip.y + 1 * s + tailWag * 0.4 },
+            { x: j.hip.x - f * (tailLen * 0.38), y: j.hip.y + 2 * s },
+            { x: j.hip.x - f * 2 * s, y: j.hip.y - 2 * s },
+          ]
+        : [
+            { x: j.hip.x - f * 2 * s, y: j.hip.y - 1 * s },
+            { x: j.hip.x - f * 12 * s, y: j.hip.y - 4 * s + tailWag * 0.4 },
+            { x: j.hip.x - f * 19 * s, y: j.hip.y - 10 * s + tailWag },
+            { x: j.hip.x - f * 14 * s, y: j.hip.y - 3 * s + tailWag * 0.5 },
+            { x: j.hip.x - f * 8 * s, y: j.hip.y + 1 * s },
+          ];
+      drawSketchPolyline(ctx, tailPts, {
+        color: inkColor,
+        lineWidth: lw * (isWolfVisual ? 0.96 : 0.78),
+        roughness: rough * 0.9,
+        seed: seed + 12,
+        passes: 1,
+        alpha: 0.92,
+      });
+    }
+
+    // 2. Back leg & back arm
+    drawSeg(j.hip.x, j.hip.y, j.kneeR.x, j.kneeR.y, seed + 1, 0.78);
+    drawSeg(j.kneeR.x, j.kneeR.y, j.footR.x, j.footR.y, seed + 2, 0.78);
+    drawSeg(j.shoulder.x, j.shoulder.y, j.elbowR.x, j.elbowR.y, seed + 3, 0.8, isWolfVisual ? 1.1 : 0.95);
+    drawSeg(j.elbowR.x, j.elbowR.y, j.handR.x, j.handR.y, seed + 4, 0.8, isWolfVisual ? 1.15 : 0.95);
+
+    // Weapon held in handR (only when not transformed into empty-handed wolf)
+    if (this.weapon && !this.isWolfForm) {
+      const vec = this.getWeaponVector();
+      drawHeldWeapon(
+        ctx,
+        this.weapon,
+        j.handR.x,
+        j.handR.y,
+        vec.dx,
+        vec.dy,
+        s,
+        seed + 62,
+      );
+    }
+
+    // 3. Plaid cloak (hooded ragged cloak in human form -> torn fluttering tatters during transform / wolf form)
+    const cloakFlutter = Math.sin(nowSec * 9 + this.seedBase) * 2.5 * s;
+    if (!isWolfVisual) {
+      const cloakPts = [
+        { x: j.shoulder.x - f * 3 * s, y: j.shoulder.y - 3 * s },
+        { x: j.hip.x - f * 16 * s, y: j.hip.y + 9 * s + cloakFlutter * 0.5 },
+        { x: j.hip.x - f * 8 * s, y: j.hip.y + 4 * s },
+        { x: j.hip.x - f * 2 * s, y: j.hip.y + 10 * s + cloakFlutter * 0.3 },
+        { x: j.hip.x + f * 5 * s, y: j.hip.y + 3 * s },
+        { x: j.shoulder.x + f * 4 * s, y: j.shoulder.y + 3 * s },
+      ];
+      ctx.save();
+      ctx.fillStyle = inkColor;
+      ctx.globalAlpha = 0.12;
+      ctx.beginPath();
+      ctx.moveTo(cloakPts[0].x, cloakPts[0].y);
+      for (let i = 1; i < cloakPts.length; i++) ctx.lineTo(cloakPts[i].x, cloakPts[i].y);
+      ctx.closePath();
+      ctx.fill();
+      ctx.restore();
+      drawSketchPolyline(ctx, cloakPts, {
+        color: inkColor,
+        lineWidth: lw * 0.72,
+        roughness: rough * 0.9,
+        seed: seed + 22,
+        passes: 1,
+        alpha: 0.9,
+      });
+      // Subtle plaid check lines on cloak
+      const cMidX = (j.shoulder.x + j.hip.x) * 0.5 - f * 4 * s;
+      const cMidY = (j.shoulder.y + j.hip.y) * 0.5;
+      drawSketchLine(ctx, cMidX - 6 * s, cMidY - 2 * s, cMidX + 4 * s, cMidY - 1 * s, {
+        color: inkColor,
+        lineWidth: 1.15 * s,
+        roughness: 0.3,
+        seed: seed + 24,
+        passes: 1,
+        alpha: 0.45,
+      });
+      drawSketchLine(ctx, cMidX - 7 * s, cMidY + 5 * s, cMidX + 5 * s, cMidY + 6 * s, {
+        color: inkColor,
+        lineWidth: 1.15 * s,
+        roughness: 0.3,
+        seed: seed + 25,
+        passes: 1,
+        alpha: 0.45,
+      });
+      drawSketchLine(ctx, j.shoulder.x - f * 4 * s, j.shoulder.y + 4 * s, j.hip.x - f * 9 * s, j.hip.y + 5 * s, {
+        color: inkColor,
+        lineWidth: 1.15 * s,
+        roughness: 0.3,
+        seed: seed + 26,
+        passes: 1,
+        alpha: 0.45,
+      });
+    } else {
+      // Torn shredded cloak tatters trailing off shoulder & hip in wolf form
+      for (let ti = 0; ti < 3; ti++) {
+        const yOff = (ti - 0.5) * 6 * s;
+        const len = (17 + (ti % 2) * 7) * s;
+        drawSketchPolyline(
+          ctx,
+          [
+            { x: j.shoulder.x - f * 2 * s, y: j.shoulder.y + yOff },
+            { x: j.shoulder.x - f * (len * 0.55), y: j.shoulder.y + yOff + 5 * s + cloakFlutter * 0.5 },
+            { x: j.shoulder.x - f * len, y: j.shoulder.y + yOff + 9 * s - cloakFlutter * 0.4 },
+          ],
+          {
+            color: inkColor,
+            lineWidth: lw * 0.55,
+            roughness: 0.8,
+            seed: seed + 27 + ti,
+            passes: 1,
+            alpha: 0.72,
+          },
+        );
+      }
+    }
+
+    // 4. Torso + zigzag wolf mane along neck/shoulder/back
+    drawSeg(j.hip.x, j.hip.y, j.shoulder.x, j.shoulder.y, seed + 5, 0.98, isWolfVisual ? 1.25 : 1.05);
+    if (isWolfVisual || morphP > 0.25) {
+      const maneCount = isWolfVisual ? 5 : 3;
+      const manePts: Array<{ x: number; y: number }> = [];
+      for (let mi = 0; mi < maneCount; mi++) {
+        const frac = mi / Math.max(1, maneCount - 1);
+        const bx = lerp(j.shoulder.x, j.hip.x, frac * 0.72) - f * 2 * s;
+        const by = lerp(j.shoulder.y - 3 * s, j.hip.y, frac * 0.72);
+        manePts.push({ x: bx, y: by });
+        manePts.push({
+          x: bx - f * (isWolfVisual ? 9.5 : 5.5) * s - (isLowHp && mi % 2 === 1 ? 2.5 * s : 0),
+          y: by - (isWolfVisual ? 4.5 : 2.5) * s,
+        });
+      }
+      drawSketchPolyline(ctx, manePts, {
+        color: inkColor,
+        lineWidth: lw * 0.72,
+        roughness: 0.65,
+        seed: seed + 34,
+        passes: 1,
+        alpha: 0.92,
+      });
+    }
+
+    // 5. Front leg & front arm
+    drawSeg(j.hip.x, j.hip.y, j.kneeL.x, j.kneeL.y, seed + 6, 0.98);
+    drawSeg(j.kneeL.x, j.kneeL.y, j.footL.x, j.footL.y, seed + 7, 0.98);
+    drawSeg(j.shoulder.x, j.shoulder.y, j.elbowL.x, j.elbowL.y, seed + 8, 0.98, isWolfVisual ? 1.15 : 0.98);
+    drawSeg(j.elbowL.x, j.elbowL.y, j.handL.x, j.handL.y, seed + 9, 0.98, isWolfVisual ? 1.18 : 0.98);
+
+    // Progressive forearm fur tufts as moonGauge fills (0 / 1 / 2 / 3 tufts at 0..33% / 33..66% / 66..100%)
+    const furTufts = isWolfVisual ? 3 : gaugeRatio <= 0 ? 0 : gaugeRatio < 0.34 ? 1 : gaugeRatio < 0.67 ? 2 : 3;
+    if (furTufts > 0 && !isKO) {
+      for (let ti = 0; ti < furTufts; ti++) {
+        const tf = 0.35 + ti * 0.24;
+        const fx = lerp(j.elbowL.x, j.handL.x, tf);
+        const fy = lerp(j.elbowL.y, j.handL.y, tf);
+        drawSketchPolyline(
+          ctx,
+          [
+            { x: fx, y: fy },
+            { x: fx - f * 4.5 * s, y: fy - 4.2 * s },
+            { x: fx + f * 1.5 * s, y: fy - 1.5 * s },
+          ],
+          {
+            color: inkColor,
+            lineWidth: 1.45 * s,
+            roughness: 0.45,
+            seed: seed + 41 + ti,
+            passes: 1,
+            alpha: 0.88,
+          },
+        );
+      }
+    }
+
+    // Broken iron chain cuffs on both wrists (human & wolf!)
+    for (const [idx, wrist] of [
+      { hand: j.handL, elb: j.elbowL },
+      { hand: j.handR, elb: j.elbowR },
+    ].entries()) {
+      const wx = lerp(wrist.hand.x, wrist.elb.x, 0.18);
+      const wy = lerp(wrist.hand.y, wrist.elb.y, 0.18);
+      drawSketchCircle(ctx, wx, wy, 2.7 * s, {
+        color: '#334155',
+        lineWidth: 1.45 * s,
+        roughness: 0.3,
+        seed: seed + 46 + idx,
+        passes: 1,
+      });
+      drawSketchPolyline(
+        ctx,
+        [
+          { x: wx, y: wy + 2.6 * s },
+          { x: wx - f * 2 * s, y: wy + 6.5 * s },
+          { x: wx + f * 1.2 * s, y: wy + 9.2 * s },
+        ],
+        {
+          color: '#334155',
+          lineWidth: 1.35 * s,
+          roughness: 0.35,
+          seed: seed + 48 + idx,
+          passes: 1,
+          alpha: 0.86,
+        },
+      );
+    }
+
+    // Fists (human) vs sharp curved claws (wolf / morph)
+    const fistR = 3.0 * this.arenaScale * visual.fistScale;
+    if (isWolfVisual) {
+      for (const [hi, hp] of [j.handL, j.handR].entries()) {
+        for (let ci = -1; ci <= 1; ci++) {
+          const ang = (ci * 0.28) - 0.1;
+          const cx0 = hp.x + f * 1.5 * s;
+          const cy0 = hp.y + ci * 2.2 * s;
+          const cx1 = cx0 + f * Math.cos(ang) * 9.5 * s;
+          const cy1 = cy0 + Math.sin(ang) * 7.5 * s + 2.5 * s;
+          drawSketchLine(ctx, cx0, cy0, cx1, cy1, {
+            color: '#0F172A',
+            lineWidth: 1.75 * s,
+            roughness: 0.25,
+            seed: seed + 52 + hi * 5 + ci,
+            passes: 1,
+          });
+        }
+      }
+    } else {
+      drawSketchCircle(ctx, j.handL.x, j.handL.y, fistR, {
+        color: inkColor,
+        lineWidth: lw * 0.72,
+        roughness: 0.45,
+        seed: seed + 10,
+        passes: 1,
+      });
+      drawSketchCircle(ctx, j.handR.x, j.handR.y, fistR, {
+        color: inkColor,
+        lineWidth: lw * 0.72,
+        roughness: 0.45,
+        seed: seed + 11,
+        passes: 1,
+        alpha: 0.85,
+      });
+    }
+
+    if (this.hasShield) {
+      drawHeldShield(
+        ctx,
+        j.handL.x,
+        j.handL.y,
+        f,
+        this.action === 'SHIELD_CROUCH',
+        s * visual.shieldDrawScale,
+        seed + 72,
+      );
+    }
+
+    // 6. Head: Human hooded face OR 1.35x Wolf head with 0.8x snout + 0.5x pointed ears + fangs + drool
+    const headR = (isWolfVisual ? 13.5 * 1.35 : 13.0) * s * visual.headScale;
+    const earScale = isWolfVisual ? 0.5 : 0.42;
+    const earTilt = isHurt ? -0.35 : 0; // Pinned ears on HURT!
+
+    // Head circle (or slightly elongated wolf cranium)
+    drawSketchCircle(ctx, j.head.x, j.head.y, headR, {
+      color: inkColor,
+      lineWidth: lw * 1.02,
+      roughness: rough,
+      seed: seed + 58,
+      passes: 1,
+    });
+
+    // Two tall pointed wolf ears poking out top of hood/head (left ear notched when <30% HP in wolf form!)
+    const earH = headR * (1 + earScale * 1.65);
+    drawSketchPolyline(
+      ctx,
+      [
+        { x: j.head.x - f * headR * 0.55, y: j.head.y - headR * 0.76 },
+        { x: j.head.x - f * (headR * 0.85 - earTilt * 10 * s), y: j.head.y - earH },
+        { x: j.head.x - f * headR * 0.12, y: j.head.y - headR * 0.94 },
+      ],
+      { color: inkColor, lineWidth: lw * 0.86, roughness: 0.4, seed: seed + 60, passes: 1 },
+    );
+    if (isWolfVisual && isLowHp) {
+      // Torn notch on rear ear at <30% HP
+      drawSketchLine(
+        ctx,
+        j.head.x - f * headR * 0.65,
+        j.head.y - earH * 0.92,
+        j.head.x - f * headR * 0.35,
+        j.head.y - earH * 0.86,
+        { color: '#DC2626', lineWidth: 1.5 * s, roughness: 0.25, seed: seed + 61, passes: 1 },
+      );
+    }
+    drawSketchPolyline(
+      ctx,
+      [
+        { x: j.head.x + f * headR * 0.05, y: j.head.y - headR * 0.95 },
+        { x: j.head.x + f * (headR * 0.35 + earTilt * 10 * s), y: j.head.y - earH * 1.03 },
+        { x: j.head.x + f * headR * 0.65, y: j.head.y - headR * 0.72 },
+      ],
+      { color: inkColor, lineWidth: lw * 0.86, roughness: 0.4, seed: seed + 62, passes: 1 },
+    );
+
+    if (!isWolfVisual) {
+      // Hood rim + shaggy mane collar around hood
+      drawSketchPolyline(
+        ctx,
+        [
+          { x: j.head.x - f * headR * 1.12, y: j.head.y + 4 * s },
+          { x: j.head.x - f * headR * 1.04, y: j.head.y - headR * 0.92 },
+          { x: j.head.x + f * headR * 0.62, y: j.head.y - headR * 1.02 },
+        ],
+        { color: inkColor, lineWidth: lw * 0.82, roughness: 0.5, seed: seed + 64, passes: 1 },
+      );
+      drawSketchPolyline(
+        ctx,
+        [
+          { x: j.head.x - 5 * s, y: j.head.y + headR * 0.88 },
+          { x: j.head.x - 8 * s, y: j.head.y + headR * 1.24 },
+          { x: j.head.x - 1 * s, y: j.head.y + headR * 1.08 },
+          { x: j.head.x + 4 * s, y: j.head.y + headR * 1.25 },
+          { x: j.head.x + 7 * s, y: j.head.y + headR * 0.88 },
+        ],
+        { color: inkColor, lineWidth: 1.5 * s, roughness: 0.45, seed: seed + 65, passes: 1 },
+      );
+    } else {
+      // Elongated 0.8x Wolf snout + black nose + open red mouth & sharp white fangs!
+      const snoutLen = headR * 0.8;
+      const snoutTipX = j.head.x + f * (headR * 0.85 + snoutLen);
+      const snoutTopY = j.head.y - 2 * s;
+      const jawY = j.head.y + 7.5 * s;
+      drawSketchPolyline(
+        ctx,
+        [
+          { x: j.head.x + f * headR * 0.55, y: j.head.y - 4.5 * s },
+          { x: snoutTipX, y: snoutTopY },
+          { x: snoutTipX - f * 3 * s, y: snoutTopY + 4.5 * s },
+          { x: j.head.x + f * headR * 0.42, y: snoutTopY + 5.2 * s },
+        ],
+        { color: inkColor, lineWidth: lw * 0.88, roughness: 0.38, seed: seed + 68, passes: 1 },
+      );
+      // Lower open jaw
+      drawSketchPolyline(
+        ctx,
+        [
+          { x: j.head.x + f * headR * 0.4, y: snoutTopY + 5.5 * s },
+          { x: snoutTipX - f * 3.5 * s, y: jawY + (this.action === 'TAUNT' ? 3 * s : 0) },
+          { x: j.head.x + f * headR * 0.25, y: j.head.y + headR * 0.85 },
+        ],
+        { color: '#DC2626', lineWidth: lw * 0.72, roughness: 0.35, seed: seed + 69, passes: 1 },
+      );
+      // Black nose tip
+      ctx.save();
+      ctx.fillStyle = '#0F172A';
+      ctx.beginPath();
+      ctx.arc(snoutTipX - f * 1.2 * s, snoutTopY + 0.6 * s, 2.5 * s, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
+      // Sharp fangs
+      const fangBaseX = snoutTipX - f * 6 * s;
+      drawSketchPolyline(
+        ctx,
+        [
+          { x: fangBaseX - f * 2 * s, y: snoutTopY + 4.5 * s },
+          { x: fangBaseX, y: snoutTopY + 9.2 * s },
+          { x: fangBaseX + f * 2 * s, y: snoutTopY + 4.5 * s },
+        ],
+        { color: '#0F172A', lineWidth: 1.4 * s, roughness: 0.2, seed: seed + 70, passes: 1 },
+      );
+      // Shaggy fur tufts along cheek when <30% HP
+      if (isLowHp) {
+        drawSketchPolyline(
+          ctx,
+          [
+            { x: j.head.x - f * headR * 0.8, y: j.head.y + 3 * s },
+            { x: j.head.x - f * headR * 1.25, y: j.head.y + 7 * s },
+            { x: j.head.x - f * headR * 0.7, y: j.head.y + 10 * s },
+          ],
+          { color: inkColor, lineWidth: 1.6 * s, roughness: 0.6, seed: seed + 71, passes: 1 },
+        );
+      }
+    }
+
+    // Cheek scar
+    drawSketchLine(
+      ctx,
+      j.head.x + f * 1.5 * s,
+      j.head.y + 2.2 * s,
+      j.head.x + f * 7.2 * s,
+      j.head.y + 6.4 * s,
+      { color: '#DC2626', lineWidth: 1.5 * s, roughness: 0.25, seed: seed + 74, passes: 1 },
+    );
+
+    // Eyes: X on KO, squeezed > < on HURT, glowing yellow fierce eyes otherwise!
+    const eyeX = j.head.x + f * headR * 0.35;
+    const eyeY = j.head.y - headR * 0.14;
+    if (isKO) {
+      drawSketchLine(ctx, eyeX - 3 * s, eyeY - 3 * s, eyeX + 3 * s, eyeY + 3 * s, {
+        color: '#0F172A',
+        lineWidth: 1.6 * s,
+        roughness: 0.3,
+        seed: seed + 75,
+        passes: 1,
+      });
+      drawSketchLine(ctx, eyeX + 3 * s, eyeY - 3 * s, eyeX - 3 * s, eyeY + 3 * s, {
+        color: '#0F172A',
+        lineWidth: 1.6 * s,
+        roughness: 0.3,
+        seed: seed + 76,
+        passes: 1,
+      });
+    } else if (isHurt) {
+      drawSketchPolyline(
+        ctx,
+        [
+          { x: eyeX - 3 * s, y: eyeY - 2.2 * s },
+          { x: eyeX + 1.5 * s, y: eyeY },
+          { x: eyeX - 3 * s, y: eyeY + 2.2 * s },
+        ],
+        { color: '#0F172A', lineWidth: 1.6 * s, roughness: 0.25, seed: seed + 77, passes: 1 },
+      );
+    } else {
+      ctx.save();
+      ctx.fillStyle = '#FACC15';
+      ctx.beginPath();
+      ctx.ellipse(eyeX, eyeY, (isWolfVisual ? 3.4 : 2.6) * s, (isWolfVisual ? 2.1 : 1.6) * s, -0.18 * f, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.strokeStyle = '#0F172A';
+      ctx.lineWidth = 1.2 * s;
+      ctx.stroke();
+      ctx.restore();
+      // Sharp pupil slit
+      drawSketchLine(ctx, eyeX + f * 0.6 * s, eyeY - 1.4 * s, eyeX + f * 0.6 * s, eyeY + 1.4 * s, {
+        color: '#0F172A',
+        lineWidth: 1.2 * s,
+        roughness: 0.15,
+        seed: seed + 78,
+        passes: 1,
+      });
+    }
+
+    // 7. Yellow Moon Phase Icon beside head (4 stages: empty/crescent/half/gibbous-full; drains in wolf form; cracked in two on KO!)
+    if (visual.moonIcon) {
+      const moonX = j.head.x - f * (headR + 10 * s);
+      const moonY = j.head.y - headR * 0.95;
+      const moonR = 7.2 * s;
+      if (isKO) {
+        // Cracked/split yellow moon in two on KO
+        ctx.save();
+        ctx.fillStyle = '#FACC15';
+        ctx.globalAlpha = 0.72;
+        ctx.beginPath();
+        ctx.arc(moonX - 2.2 * s, moonY, moonR * 0.85, Math.PI * 0.45, Math.PI * 1.55);
+        ctx.closePath();
+        ctx.fill();
+        ctx.beginPath();
+        ctx.arc(moonX + 2.2 * s, moonY + 1 * s, moonR * 0.85, -Math.PI * 0.55, Math.PI * 0.55);
+        ctx.closePath();
+        ctx.fill();
+        ctx.restore();
+        drawSketchLine(ctx, moonX - 1 * s, moonY - moonR, moonX + 1.5 * s, moonY + moonR, {
+          color: '#0F172A',
+          lineWidth: 1.4 * s,
+          roughness: 0.4,
+          seed: seed + 80,
+          passes: 1,
+        });
+      } else {
+        // 4 visible waxing phases + smooth halo glow when ready/wolf
+        if (this.isWolfForm || gaugeRatio >= 0.75) {
+          drawSketchCircle(ctx, moonX, moonY, moonR + 2.6 * s, {
+            color: '#FACC15',
+            lineWidth: 1.2 * s,
+            roughness: 0.7,
+            seed: seed + 81,
+            passes: 1,
+            alpha: 0.72,
+          });
+        }
+        ctx.save();
+        ctx.fillStyle = '#FFFDF7';
+        ctx.beginPath();
+        ctx.arc(moonX, moonY, moonR, 0, Math.PI * 2);
+        ctx.fill();
+        if (gaugeRatio > 0.02) {
+          ctx.fillStyle = '#FACC15';
+          const stage = this.isWolfForm
+            ? gaugeRatio
+            : gaugeRatio < 0.25
+              ? 0.22
+              : gaugeRatio < 0.5
+                ? 0.42
+                : gaugeRatio < 0.75
+                  ? 0.68
+                  : 1.0;
+          ctx.beginPath();
+          ctx.arc(moonX, moonY, moonR * 0.92, -Math.PI * 0.5, Math.PI * 0.5);
+          if (stage < 0.96) {
+            const innerRx = moonR * 0.92 * Math.abs(1 - stage * 2);
+            ctx.ellipse(moonX, moonY, innerRx, moonR * 0.92, 0, Math.PI * 0.5, -Math.PI * 0.5, stage >= 0.5);
+          } else {
+            ctx.arc(moonX, moonY, moonR * 0.92, Math.PI * 0.5, -Math.PI * 0.5);
+          }
+          ctx.closePath();
+          ctx.fill();
+        }
+        ctx.restore();
+        drawSketchCircle(ctx, moonX, moonY, moonR, {
+          color: '#0F172A',
+          lineWidth: 1.35 * s,
+          roughness: 0.3,
+          seed: seed + 82,
+          passes: 1,
+        });
+      }
+    }
+
+    // Block / Shield crouch arc
+    if (this.action === 'BLOCK' || this.action === 'SHIELD_CROUCH') {
+      const isShieldCrouch = this.action === 'SHIELD_CROUCH';
+      const bx = j.handL.x + f * (isShieldCrouch ? 16 : 8) * s;
+      const by = isShieldCrouch ? j.handL.y - 2 * s : (j.handL.y + j.handR.y) * 0.5;
+      const arcHalf = (isShieldCrouch ? 22 : 16) * s;
+      const arcColor = isShieldCrouch ? '#1E3A8A' : '#475569';
+      drawSketchLine(ctx, bx, by - arcHalf, bx + f * 5 * s, by, {
+        color: arcColor,
+        lineWidth: 2.1 * s,
+        roughness: 1.0,
+        seed: seed + 25,
+        passes: 2,
+        alpha: 0.84,
+      });
+      drawSketchLine(ctx, bx + f * 5 * s, by, bx, by + arcHalf, {
+        color: arcColor,
+        lineWidth: 2.1 * s,
+        roughness: 1.0,
+        seed: seed + 26,
+        passes: 2,
+        alpha: 0.84,
+      });
+    }
+
+    // Pounce speed streaks during wolf SLIDE / DASH
+    if (isWolfVisual && (this.action === 'SLIDE' || this.action === 'DASH')) {
+      for (let i = 0; i < 3; i++) {
+        const ly = j.shoulder.y + (i - 1) * 9 * s;
+        const lx = j.shoulder.x - f * (18 + i * 7) * s;
+        drawSketchLine(ctx, lx, ly, lx - f * 22 * s, ly, {
+          color: '#FACC15',
+          lineWidth: 1.8 * s,
+          roughness: 0.6,
+          seed: seed + 88 + i,
+          passes: 1,
+          alpha: 0.72,
+        });
+      }
+    }
+
+    if (this.hasTempStatus('creamPie')) {
+      this.drawCreamPieSmear(ctx, j, s, seed);
+    }
+
+    // Pencil X mark on KO
+    if (isKO) {
+      const cx = (j.hip.x + j.head.x) * 0.5;
+      const cy = this.y - 16 * s;
+      drawSketchLine(ctx, cx - 22 * s, cy - 12 * s, cx + 22 * s, cy + 12 * s, {
+        color: '#1E293B',
+        lineWidth: 2.0 * s,
+        roughness: 0.5,
+        seed: seed + 95,
+        passes: 1,
+        alpha: 0.78,
+      });
+      drawSketchLine(ctx, cx + 22 * s, cy - 12 * s, cx - 22 * s, cy + 12 * s, {
+        color: '#1E293B',
+        lineWidth: 2.0 * s,
+        roughness: 0.5,
+        seed: seed + 96,
+        passes: 1,
+        alpha: 0.78,
+      });
+    }
+
     void floorY;
   }
 }

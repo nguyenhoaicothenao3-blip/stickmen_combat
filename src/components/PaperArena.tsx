@@ -789,6 +789,8 @@ export const PaperArena: React.FC = () => {
           impactX,
           impactY,
           weaponSource: spec.weaponType,
+          minX,
+          maxX,
           opts: {
             guardBreak: spec.guardBreak,
             slow: spec.slow,

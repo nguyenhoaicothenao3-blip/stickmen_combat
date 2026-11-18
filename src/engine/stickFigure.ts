@@ -196,6 +196,7 @@ export interface TakeHitResult {
   hitConnected: boolean;
   fullyBlocked: boolean;
   armored: boolean;
+  appliedKbX: number;
 }
 
 export interface HitResolvedEvent {
@@ -235,6 +236,8 @@ export interface ResolveHitInput {
   impactX: number;
   impactY: number;
   weaponSource?: PrimaryWeaponType | 'shield' | null;
+  minX?: number;
+  maxX?: number;
   opts?: {
     guardBreak?: boolean;
     slow?: boolean;
@@ -269,6 +272,8 @@ export function resolveHit(input: ResolveHitInput): HitResolvedEvent {
     impactX,
     impactY,
     weaponSource = null,
+    minX,
+    maxX,
     opts,
   } = input;
 
@@ -302,6 +307,7 @@ export function resolveHit(input: ResolveHitInput): HitResolvedEvent {
       hitConnected: true,
       fullyBlocked: false,
       armored: false,
+      appliedKbX: 0,
     };
   } else {
     res = defender.takeHit(
@@ -323,6 +329,84 @@ export function resolveHit(input: ResolveHitInput): HitResolvedEvent {
         attackerPinStyle: attacker?.characterId === 'hebongbay' ? 'hebongbay' : 'standard',
       },
     );
+  }
+
+  // Luật 1: Đẩy lùi người đánh (Corner Pushback) — tất định, không RNG, mỗi đòn tối đa 1 lần
+  const effMinX = minX ?? defender.arenaMinX;
+  const effMaxX = maxX ?? defender.arenaMaxX;
+  const isHeavyOrKnockdown =
+    heavy || defender.action === 'KNOCKDOWN' || defender.hp <= 0;
+  const isShieldThrow =
+    attackType === 'SHIELD_THROW' || weaponSource === 'shield';
+  const isAreaSweep =
+    isAoe || attackType === 'SWORD_3' || attackType === 'HAMMER_2';
+  const attackerRestricted =
+    !attacker ||
+    attacker.isDragged ||
+    [
+      'PINNED',
+      'HURT',
+      'KNOCKDOWN',
+      'GETUP',
+      'SLIP',
+      'DRAGGED',
+      'KO',
+      'TAKEOFF_LAND_STUCK',
+    ].includes(attacker.action);
+
+  if (
+    res.hitConnected &&
+    !res.armored &&
+    !res.fullyBlocked &&
+    res.appliedKbX > 0 &&
+    !directEnvHit &&
+    !isAmbient &&
+    !isDrawnWeapon &&
+    !isHeavyOrKnockdown &&
+    !isShieldThrow &&
+    !isAreaSweep &&
+    !attackerRestricted &&
+    !attacker.hasCornerPushbackThisAction
+  ) {
+    const cornerMargin = 40 * defender.scale;
+    const nearLeftEdge =
+      defender.x - effMinX < cornerMargin && attackerDir < 0;
+    const nearRightEdge =
+      effMaxX - defender.x < cornerMargin && attackerDir > 0;
+    if (nearLeftEdge || nearRightEdge) {
+      const transferredKbX = res.appliedKbX * 0.5;
+      defender.vx = attackerDir * (res.appliedKbX - transferredKbX);
+      attacker.vx = -attackerDir * transferredKbX;
+      attacker.hasCornerPushbackThisAction = true;
+
+      for (let k = 0; k < 2; k++) {
+        particles.push({
+          x: attacker.x + (k - 0.5) * 6 * attacker.scale,
+          y: attacker.y - 2 * attacker.scale,
+          vx: -attackerDir * (32 + k * 14),
+          vy: -10 - k * 6,
+          life: 0.24,
+          maxLife: 0.24,
+          size: (8 + k * 2.5) * attacker.scale,
+          color: '#334155',
+          kind: 'line',
+          angle: attackerDir === 1 ? Math.PI + 0.16 : -0.16,
+          spin: 0,
+          seed: (attacker.seedBase + k * 17) % 100,
+        });
+      }
+      callouts.push({
+        x: attacker.x - attackerDir * 8 * attacker.scale,
+        y: attacker.y - 14 * attacker.scale,
+        vy: -26,
+        text: 'LÙI!',
+        color: '#475569',
+        life: 0.44,
+        maxLife: 0.44,
+        scale: 0.78,
+        tilt: attackerDir * 0.1,
+      });
+    }
   }
 
   const actualDamage = Math.max(0, hpBefore - defender.hp);
@@ -406,6 +490,7 @@ export class StickFighter {
   public actionTime = 0;
   public actionDuration = 0;
   public hasHitThisAction = false;
+  public hasCornerPushbackThisAction = false;
   public hasPlayedWhoosh = false;
   public hasBeenPulledOut = false;
 
@@ -414,6 +499,8 @@ export class StickFighter {
   public arenaScale = 1;
   public scale = 1;
   public hitboxScale = 1;
+  public arenaMinX = 0;
+  public arenaMaxX = 800;
   public consecutiveHitsTaken = 0;
   public damageTakenWithShield = 0;
   public isEnraged = false;
@@ -646,6 +733,7 @@ export class StickFighter {
     this.actionTime = 0;
     this.actionDuration = 0;
     this.hasHitThisAction = false;
+    this.hasCornerPushbackThisAction = false;
     this.hasPlayedWhoosh = false;
     this.hasBeenPulledOut = false;
     this.aiCooldown = 0.25;
@@ -803,6 +891,7 @@ export class StickFighter {
       this.comboBeatCount = 0;
     }
     this.hasHitThisAction = false;
+    this.hasCornerPushbackThisAction = false;
     this.hasPlayedWhoosh = false;
     this.hasReleasedShield = false;
     this.triggeredHammerJump = false;
@@ -2174,7 +2263,7 @@ export class StickFighter {
           this.action === 'ROLL_DODGE' ||
           this.rollInvulnTimer > 0))
     ) {
-      return { actualDamage: 0, hitConnected: false, fullyBlocked: false, armored: false };
+      return { actualDamage: 0, hitConnected: false, fullyBlocked: false, armored: false, appliedKbX: 0 };
     }
 
     const wDef = weaponSource ? WEAPONS[weaponSource] : null;
@@ -2228,7 +2317,7 @@ export class StickFighter {
         this.comboQueue = [];
         this.startAction('KNOCKDOWN', 0.9);
       }
-      return { actualDamage: armoredDmg, hitConnected: true, fullyBlocked: false, armored: true };
+      return { actualDamage: armoredDmg, hitConnected: true, fullyBlocked: false, armored: true, appliedKbX: 0 };
     }
 
     // 0a. VENT_WARN / TAKEOFF_WARN charge phase: takes damage normally but immune to knockback & hitstun!
@@ -2259,7 +2348,7 @@ export class StickFighter {
         this.comboQueue = [];
         this.startAction('KNOCKDOWN', 0.9);
       }
-      return { actualDamage: warnDmg, hitConnected: true, fullyBlocked: false, armored: true };
+      return { actualDamage: warnDmg, hitConnected: true, fullyBlocked: false, armored: true, appliedKbX: 0 };
     }
 
     // 0b. Thick Skin trait ("Da dày"): light hits (<12) during windup subtract HP without breaking combo or knocking back!
@@ -2307,7 +2396,7 @@ export class StickFighter {
         this.comboQueue = [];
         this.startAction('KNOCKDOWN', 0.9);
       }
-      return { actualDamage: damage, hitConnected: true, fullyBlocked: false, armored: true };
+      return { actualDamage: damage, hitConnected: true, fullyBlocked: false, armored: true, appliedKbX: 0 };
     }
 
     // Check if victim was mid-combo / mid-windup so strong hits break their combo visibly
@@ -2368,7 +2457,8 @@ export class StickFighter {
           spin: 0,
           seed: Math.random() * 100,
         });
-        this.vx = attackerDir * effKbX * 0.2;
+        const kbApplied = effKbX * 0.2;
+        this.vx = attackerDir * kbApplied;
         callouts.push({
           x: impactX,
           y: impactY - 24 * this.scale,
@@ -2380,13 +2470,14 @@ export class StickFighter {
           scale: 0.94,
           tilt: (Math.random() - 0.5) * 0.2,
         });
-        return { actualDamage: 0, hitConnected: true, fullyBlocked: true, armored: false };
+        return { actualDamage: 0, hitConnected: true, fullyBlocked: true, armored: false, appliedKbX: kbApplied };
       }
 
       const reduced = Math.max(1, Math.round(damage * 0.22));
       this.hp = Math.max(0, this.hp - reduced);
       if (this.hasShield) this.damageTakenWithShield += reduced;
-      this.vx = attackerDir * effKbX * (weaponSource === 'hammer' ? 0.45 : 0.28);
+      const kbApplied = effKbX * (weaponSource === 'hammer' ? 0.45 : 0.28);
+      this.vx = attackerDir * kbApplied;
       callouts.push({
         x: impactX,
         y: impactY - 24 * this.scale,
@@ -2401,7 +2492,7 @@ export class StickFighter {
       if (this.hp <= 0) {
         this.startAction('KNOCKDOWN', 0.9);
       }
-      return { actualDamage: reduced, hitConnected: true, fullyBlocked: false, armored: false };
+      return { actualDamage: reduced, hitConnected: true, fullyBlocked: false, armored: false, appliedKbX: kbApplied };
     }
 
     // 2. Standard forearm block (broken by BAT_2 feint guard-break!)
@@ -2412,7 +2503,8 @@ export class StickFighter {
       this.hp = Math.max(0, this.hp - actualDamage);
       if (this.hasShield) this.damageTakenWithShield += actualDamage;
       this.hitFlash = 0.1;
-      this.vx = attackerDir * effKbX * (weaponSource === 'hammer' ? 0.6 : 0.35);
+      const kbApplied = effKbX * (weaponSource === 'hammer' ? 0.6 : 0.35);
+      this.vx = attackerDir * kbApplied;
       if (this.characterId === 'lonsat') {
         sfx.playMetalPotClang(false);
       } else {
@@ -2450,7 +2542,7 @@ export class StickFighter {
       if (this.hp <= 0) {
         this.startAction('KNOCKDOWN', 0.9);
       }
-      return { actualDamage, hitConnected: true, fullyBlocked: false, armored: false };
+      return { actualDamage, hitConnected: true, fullyBlocked: false, armored: false, appliedKbX: kbApplied };
     }
 
     if (opts?.guardBreak && (this.action === 'BLOCK' || this.action === 'SHIELD_CROUCH')) {
@@ -2508,15 +2600,16 @@ export class StickFighter {
         scale: 0.86,
         tilt: (Math.random() - 0.5) * 0.2,
       });
-      this.vx = attackerDir * effKbX * 0.55;
+      const kbApplied = effKbX * 0.55;
+      this.vx = attackerDir * kbApplied;
       this.vy = effKbY * 0.45;
       this.comboQueue = [];
       if (this.hp <= 0) {
         this.startAction('KNOCKDOWN', 0.9);
       } else {
-        this.startAction('HURT', 0.2);
+        this.startAction('HURT', this.getDiminishedHurtDuration(0.2));
       }
-      return { actualDamage: glancedDamage, hitConnected: true, fullyBlocked: false, armored: false };
+      return { actualDamage: glancedDamage, hitConnected: true, fullyBlocked: false, armored: false, appliedKbX: kbApplied };
     }
 
     // 4. Clean unblocked hit
@@ -2828,17 +2921,17 @@ export class StickFighter {
       this.comboQueue = [];
       this.isRecoverySliding = false;
       this.startAction('KNOCKDOWN', 0.9);
-      return { actualDamage: damage, hitConnected: true, fullyBlocked: false, armored: false };
+      return { actualDamage: damage, hitConnected: true, fullyBlocked: false, armored: false, appliedKbX: effKbX };
     }
 
     // While flying in TAKEOFF_FLIGHT, ranged hits hurt HP & wingHp without cancelling flight unless wingHp <= 0 (handled in onHitResolved)
     if (this.action === 'TAKEOFF_FLIGHT') {
-      return { actualDamage: damage, hitConnected: true, fullyBlocked: false, armored: false };
+      return { actualDamage: damage, hitConnected: true, fullyBlocked: false, armored: false, appliedKbX: effKbX };
     }
 
     // Light hit during Cao Kều's controlled recovery slide subtracts HP & knockback WITHOUT cancelling the slide!
     if (this.isRecoverySliding && !heavy && !opts?.pin && !opts?.homeRun) {
-      return { actualDamage: damage, hitConnected: true, fullyBlocked: false, armored: false };
+      return { actualDamage: damage, hitConnected: true, fullyBlocked: false, armored: false, appliedKbX: effKbX };
     }
 
     this.comboQueue = [];
@@ -2868,7 +2961,7 @@ export class StickFighter {
         scale: 1.0,
         tilt: -0.1,
       });
-      return { actualDamage: damage, hitConnected: true, fullyBlocked: false, armored: false };
+      return { actualDamage: damage, hitConnected: true, fullyBlocked: false, armored: false, appliedKbX: 0 };
     }
 
     // Hề Bóng Bay comedic hit reaction: pops a shoe briefly + emits balloon deflation puffs & confetti!
@@ -2930,9 +3023,17 @@ export class StickFighter {
     } else if (heavy) {
       this.startAction('KNOCKDOWN', opts?.homeRun ? 0.85 : 0.65);
     } else {
-      this.startAction('HURT', wasMidCombo ? 0.34 : 0.24);
+      // Luật 2: Choáng ngắn dần theo số đòn liên tiếp (x0.85 mỗi đòn trước đó, tối thiểu x0.6 từ đòn thứ 4)
+      this.startAction('HURT', this.getDiminishedHurtDuration(wasMidCombo ? 0.34 : 0.24));
     }
-    return { actualDamage: damage, hitConnected: true, fullyBlocked: false, armored: false };
+    return { actualDamage: damage, hitConnected: true, fullyBlocked: false, armored: false, appliedKbX: effKbX };
+  }
+
+  // Luật 2: Tính thời gian HURT giảm dần theo chuỗi đòn liên tiếp đã nhận
+  private getDiminishedHurtDuration(baseDuration: number): number {
+    const priorHits = Math.max(0, this.consecutiveHitsTaken - 1);
+    const mult = priorHits >= 3 ? 0.6 : Math.max(0.6, Math.pow(0.85, priorHits));
+    return baseDuration * mult;
   }
 
   public update(
@@ -2948,6 +3049,8 @@ export class StickFighter {
     looseShieldX: number | null = null,
     arenaTraps: ArenaTrapSnapshot[] = [],
   ) {
+    this.arenaMinX = minX;
+    this.arenaMaxX = maxX;
     this.actionTime += dt;
     if (this.hitFlash > 0) this.hitFlash = Math.max(0, this.hitFlash - dt);
     if (this.winkTimer > 0) this.winkTimer = Math.max(0, this.winkTimer - dt);
